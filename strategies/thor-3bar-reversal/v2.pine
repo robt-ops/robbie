@@ -1,0 +1,256 @@
+//@version=6
+// =============================================================
+// THOR 3-Bar Reversal — v2 [Selective]
+// =============================================================
+// Goal: fewer trades, higher quality, better R:R.
+//
+// Changes vs v1:
+//   + Bar 2 must close in lower 40% of its range (pullback strength) for longs,
+//     upper 40% for shorts.
+//   + Bar 3 must close beyond Bar 1's high (longs) / low (shorts) — true
+//     reversal that overruns the entire pullback, not just bar 2.
+//   + ATR floor filter: skip signals when ATR < 0.6 * 20-bar average ATR
+//     (dead/illiquid markets where the move can't reach the target).
+//   + Volume requirement raised to 1.5x (from 1.25x).
+//   + Stop tightened to 1.0 ATR, target widened to 2.5 ATR → 2.5:1 base R:R
+//     (vs 1.6:1 in v1).
+//   + Max bars held reduced to 10 (from 12) — selective entries should
+//     resolve faster.
+// =============================================================
+strategy("THOR 3-Bar v2 [Selective]", overlay=true,
+    initial_capital=25000,
+    commission_type=strategy.commission.percent,
+    commission_value=0.01,
+    slippage=2,
+    pyramiding=0,
+    use_bar_magnifier=true)
+
+// ---------- Strategy inputs ----------
+gS = "Strategy"
+tradeMode    = input.string("Both", "Trade Mode", options=["Both", "Long Only", "Short Only"], group=gS)
+emaLen       = input.int(50,   "EMA Trend Length",        group=gS)
+htfTf        = input.timeframe("15", "Higher TF",         group=gS)
+htfEmaLen    = input.int(50,   "Higher TF EMA",           group=gS)
+atrLen       = input.int(14,   "ATR Length",              group=gS)
+volLen       = input.int(20,   "Volume SMA",              group=gS)
+volMult      = input.float(1.50, "Min Volume Multiple",   group=gS) // tighter
+minBodyPct   = input.float(0.55, "Min Candle Body %",     group=gS) // tighter
+riskATR      = input.float(1.00, "Stop ATR",              group=gS) // tighter
+targetATR    = input.float(2.50, "Target ATR",            group=gS) // wider
+beTrigger    = input.float(1.00, "Break Even Trigger ATR",group=gS)
+maxBarsHold  = input.int(10,   "Max Bars In Trade",       group=gS) // shorter
+useVWAP      = input.bool(true, "Use VWAP Filter",        group=gS)
+useHTF       = input.bool(true, "Use Higher TF Filter",   group=gS)
+useBE        = input.bool(true, "Use Break Even Stop",    group=gS)
+useSession   = input.bool(true, "RTH Only",               group=gS)
+sessionRTH   = input.session("0835-1455", "Session Central Time", group=gS)
+
+// v2-specific filters
+gQ = "Quality Filters (v2)"
+bar2DepthPct = input.float(0.40, "Bar 2 close depth (lower/upper fraction)", minval=0.10, maxval=0.90, step=0.05, group=gQ)
+atrFloorMult = input.float(0.60, "ATR floor vs 20-bar avg",                  minval=0.10, maxval=2.00, step=0.05, group=gQ)
+atrAvgLen    = input.int(20,     "ATR avg length",                            group=gQ)
+
+// ---------- Display inputs ----------
+gD = "Display"
+showLevels = input.bool(true, "Show Trade Levels", group=gD)
+showTint   = input.bool(true, "Show In-Trade Tint", group=gD)
+showTable  = input.bool(true, "Show Status Table",  group=gD)
+showLabels = input.bool(true, "Show Entry Labels",  group=gD)
+
+// ---------- Core ----------
+ema    = ta.ema(close, emaLen)
+atr    = ta.atr(atrLen)
+atrAvg = ta.sma(atr, atrAvgLen)
+vwap   = ta.vwap(hlc3)
+volSma = ta.sma(volume, volLen)
+volOk  = volume > volSma * volMult
+atrOk  = atr > atrAvg * atrFloorMult
+
+htfClose = request.security(syminfo.tickerid, htfTf, close, lookahead=barmerge.lookahead_off)
+htfEma   = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfEmaLen), lookahead=barmerge.lookahead_off)
+
+inSession = not useSession or not na(time(timeframe.period, sessionRTH, "America/Chicago"))
+flat      = strategy.position_size == 0
+
+canLong  = tradeMode == "Both" or tradeMode == "Long Only"
+canShort = tradeMode == "Both" or tradeMode == "Short Only"
+
+htfLongOk  = not useHTF or htfClose > htfEma
+htfShortOk = not useHTF or htfClose < htfEma
+
+bodyPct      = (high - low) > syminfo.mintick ? math.abs(close - open) / (high - low) : 0.0
+bodyFilterOk = bodyPct >= minBodyPct
+
+// ---------- Pattern (v2: stricter) ----------
+bar2Range = high[1] - low[1]
+bar2InLowerZone = bar2Range > 0 and (close[1] - low[1]) <= bar2Range * bar2DepthPct
+bar2InUpperZone = bar2Range > 0 and (high[1] - close[1]) <= bar2Range * bar2DepthPct
+
+bar1Bear  = close[2] < open[2]
+bar2Lower = low[1]  < low[2]
+bar3Bull  = close > open and close > high[2]  // overrun bar 1
+
+bar1Bull   = close[2] > open[2]
+bar2Higher = high[1]  > high[2]
+bar3Bear   = close < open and close < low[2]  // overrun bar 1
+
+// ---------- Signals ----------
+longSignal = flat and canLong and
+    bar1Bear and bar2Lower and bar2InLowerZone and bar3Bull and
+    bodyFilterOk and atrOk and
+    close > ema and volOk and inSession and
+    htfLongOk and
+    (not useVWAP or close > vwap)
+
+shortSignal = flat and canShort and
+    bar1Bull and bar2Higher and bar2InUpperZone and bar3Bear and
+    bodyFilterOk and atrOk and
+    close < ema and volOk and inSession and
+    htfShortOk and
+    (not useVWAP or close < vwap)
+
+// ---------- State ----------
+var float entryAtr         = na
+var int   entryBar         = na
+var bool  longBETriggered  = false
+var bool  shortBETriggered = false
+
+if longSignal
+    entryAtr         := atr
+    entryBar         := bar_index
+    longBETriggered  := false
+    shortBETriggered := false
+    strategy.entry("Long", strategy.long)
+
+if shortSignal
+    entryAtr         := atr
+    entryBar         := bar_index
+    longBETriggered  := false
+    shortBETriggered := false
+    strategy.entry("Short", strategy.short)
+
+if strategy.position_size > 0 and not na(entryAtr) and bar_index > entryBar
+    if high >= strategy.position_avg_price + entryAtr * beTrigger
+        longBETriggered := true
+
+if strategy.position_size < 0 and not na(entryAtr) and bar_index > entryBar
+    if low <= strategy.position_avg_price - entryAtr * beTrigger
+        shortBETriggered := true
+
+// ---------- Stop / Target ----------
+longBaseStop  = not na(entryAtr) ? strategy.position_avg_price - entryAtr * riskATR : na
+shortBaseStop = not na(entryAtr) ? strategy.position_avg_price + entryAtr * riskATR : na
+
+longStop  = (useBE and longBETriggered)  ? strategy.position_avg_price : longBaseStop
+shortStop = (useBE and shortBETriggered) ? strategy.position_avg_price : shortBaseStop
+
+longTarget  = not na(entryAtr) ? strategy.position_avg_price + entryAtr * targetATR : na
+shortTarget = not na(entryAtr) ? strategy.position_avg_price - entryAtr * targetATR : na
+
+// ---------- Exits ----------
+if strategy.position_size > 0 and not na(entryAtr)
+    strategy.exit("Long Exit", "Long", stop=longStop, limit=longTarget)
+
+if strategy.position_size < 0 and not na(entryAtr)
+    strategy.exit("Short Exit", "Short", stop=shortStop, limit=shortTarget)
+
+barsInTrade = not na(entryBar) ? bar_index - entryBar : na
+
+if strategy.position_size > 0 and not na(barsInTrade) and barsInTrade >= maxBarsHold
+    strategy.cancel("Long Exit")
+    strategy.close("Long", comment="Time Stop")
+
+if strategy.position_size < 0 and not na(barsInTrade) and barsInTrade >= maxBarsHold
+    strategy.cancel("Short Exit")
+    strategy.close("Short", comment="Time Stop")
+
+sessionEnd = useSession and
+    na(time(timeframe.period, sessionRTH, "America/Chicago")) and
+    not na(time(timeframe.period, sessionRTH, "America/Chicago")[1])
+
+if sessionEnd and strategy.position_size != 0
+    strategy.cancel_all()
+    strategy.close_all(comment="Session Close")
+
+wasInTrade = strategy.position_size[1] != 0 and strategy.position_size == 0
+if wasInTrade
+    entryAtr         := na
+    entryBar         := na
+    longBETriggered  := false
+    shortBETriggered := false
+
+// ---------- Visuals ----------
+inLong   = strategy.position_size > 0
+inShort  = strategy.position_size < 0
+inTrade  = inLong or inShort
+avgPx    = strategy.position_avg_price
+
+plot(ema,  "EMA",   color=color.orange, linewidth=2)
+plot(vwap, "VWAP",  color=color.blue,   linewidth=2)
+plot(useHTF ? htfEma : na, "HTF EMA", color=color.purple, linewidth=2)
+
+plot(showLevels and inTrade   ? avgPx        : na, "Entry",        color=color.white, style=plot.style_linebr, linewidth=1)
+plot(showLevels and inLong    ? longStop     : na, "Long Stop",    color=color.red,   style=plot.style_linebr, linewidth=2)
+plot(showLevels and inLong    ? longTarget   : na, "Long Target",  color=color.green, style=plot.style_linebr, linewidth=2)
+plot(showLevels and inShort   ? shortStop    : na, "Short Stop",   color=color.red,   style=plot.style_linebr, linewidth=2)
+plot(showLevels and inShort   ? shortTarget  : na, "Short Target", color=color.green, style=plot.style_linebr, linewidth=2)
+
+bgcolor(showTint and inLong  ? color.new(color.green, 92) : na, title="Long Tint")
+bgcolor(showTint and inShort ? color.new(color.red,   92) : na, title="Short Tint")
+
+if showLabels and longSignal
+    entryPx = close
+    sl      = entryPx - atr * riskATR
+    tp      = entryPx + atr * targetATR
+    rr      = (tp - entryPx) / (entryPx - sl)
+    txt = "v2 BUY\n@ " + str.tostring(entryPx, format.mintick)
+         + "\nSL " + str.tostring(sl, format.mintick)
+         + "\nTP " + str.tostring(tp, format.mintick)
+         + "\nR:R " + str.tostring(rr, "#.##")
+    label.new(bar_index, low, txt,
+         style=label.style_label_up,
+         color=color.new(color.green, 0),
+         textcolor=color.white,
+         size=size.small)
+
+if showLabels and shortSignal
+    entryPx = close
+    sl      = entryPx + atr * riskATR
+    tp      = entryPx - atr * targetATR
+    rr      = (entryPx - tp) / (sl - entryPx)
+    txt = "v2 SELL\n@ " + str.tostring(entryPx, format.mintick)
+         + "\nSL " + str.tostring(sl, format.mintick)
+         + "\nTP " + str.tostring(tp, format.mintick)
+         + "\nR:R " + str.tostring(rr, "#.##")
+    label.new(bar_index, high, txt,
+         style=label.style_label_down,
+         color=color.new(color.red, 0),
+         textcolor=color.white,
+         size=size.small)
+
+plotshape(longSignal,  title="Buy",  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.small)
+plotshape(shortSignal, title="Sell", style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.small)
+
+var table tbl = table.new(position.top_right, 2, 10, bgcolor=color.new(color.black, 75), border_width=1, border_color=color.new(color.gray, 50))
+if showTable and barstate.islast
+    table.cell(tbl, 0, 0, "v2 SELECTIVE", text_color=color.aqua, bgcolor=color.new(color.navy, 0))
+    table.cell(tbl, 1, 0, "",             bgcolor=color.new(color.navy, 0))
+    table.cell(tbl, 0, 1, "EMA Trend",    text_color=color.silver)
+    table.cell(tbl, 1, 1, close > ema ? "UP" : "DN", text_color=close > ema ? color.lime : color.red)
+    table.cell(tbl, 0, 2, "HTF Trend",    text_color=color.silver)
+    table.cell(tbl, 1, 2, htfClose > htfEma ? "UP" : "DN", text_color=htfClose > htfEma ? color.lime : color.red)
+    table.cell(tbl, 0, 3, "VWAP",         text_color=color.silver)
+    table.cell(tbl, 1, 3, close > vwap ? "ABOVE" : "BELOW", text_color=close > vwap ? color.lime : color.red)
+    table.cell(tbl, 0, 4, "Vol (1.5x)",   text_color=color.silver)
+    table.cell(tbl, 1, 4, volOk ? "OK" : "low", text_color=volOk ? color.lime : color.gray)
+    table.cell(tbl, 0, 5, "ATR Floor",    text_color=color.silver)
+    table.cell(tbl, 1, 5, atrOk ? "OK" : "dead", text_color=atrOk ? color.lime : color.gray)
+    table.cell(tbl, 0, 6, "Body %",       text_color=color.silver)
+    table.cell(tbl, 1, 6, str.tostring(bodyPct * 100, "#") + "%", text_color=bodyFilterOk ? color.lime : color.gray)
+    table.cell(tbl, 0, 7, "Session",      text_color=color.silver)
+    table.cell(tbl, 1, 7, inSession ? "RTH" : "off", text_color=inSession ? color.lime : color.gray)
+    table.cell(tbl, 0, 8, "Position",     text_color=color.silver)
+    table.cell(tbl, 1, 8, inLong ? "LONG" : inShort ? "SHORT" : "flat", text_color=inTrade ? color.yellow : color.gray)
+    table.cell(tbl, 0, 9, "Bars Held",    text_color=color.silver)
+    table.cell(tbl, 1, 9, str.tostring(nz(barsInTrade, 0)), text_color=color.white)
