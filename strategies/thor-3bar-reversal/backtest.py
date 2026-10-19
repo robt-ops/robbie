@@ -11,7 +11,9 @@ CSV format (header required):
 Notes:
     Approximate replica of the Pine Script logic. Will NOT match TV's
     Strategy Tester exactly because:
-      - No bar magnifier (intra-bar fills assume worst-case order).
+      - No bar magnifier; bars spanning both stop and target are resolved
+        by --ambiguous (default stop = worst case). Run both ways to see
+        how much of a result rides on the unknown intra-bar path.
       - VWAP resets daily on first-bar-of-session, not on TV's session boundary.
       - HTF resample uses pandas resample, not request.security.
       - Commissions/slippage are flat percent, not TV's model.
@@ -68,6 +70,7 @@ class Config:
     target_atr: float = 2.00
     be_trigger: float = 1.00
     max_bars_hold: int = 12
+    use_ema: bool = True
     use_vwap: bool = True
     use_htf: bool = True
     use_be: bool = True
@@ -86,6 +89,7 @@ class Config:
     trail_atr: float = 1.5
     # fill model
     entry_mode: str = "next_open"   # "next_open" (realistic) | "close" (look-ahead)
+    ambiguous: str = "stop"         # bar spans stop AND target: which filled first
     # cost model
     commission_pct: float = 0.0001  # 0.01%
     slippage_ticks: float = 2.0
@@ -160,8 +164,8 @@ def run(df: pd.DataFrame, cfg: Config) -> dict:
     short_pattern = bar1_bull & bar2_higher & bar3_bear
 
     body_ok = df["body_pct"] >= cfg.min_body_pct
-    ema_long = c > df["ema"]
-    ema_short = c < df["ema"]
+    ema_long = (c > df["ema"]) if cfg.use_ema else pd.Series(True, index=df.index)
+    ema_short = (c < df["ema"]) if cfg.use_ema else pd.Series(True, index=df.index)
     vol_ok = df["volume"] > df["vol_sma"] * cfg.vol_mult
     # `~` on a Python bool gives an int (~True == -2), which ORs into an
     # always-true mask and silently disables the filter. Branch instead.
@@ -213,12 +217,15 @@ def run(df: pd.DataFrame, cfg: Config) -> dict:
     trail = None
     be_hit = False
     strong = False
+    ambiguous = 0               # bars that spanned both stop and target
     pending = 0                 # order armed by the previous bar's signal
     pending_atr = 0.0
     pending_strong = False
 
     if cfg.entry_mode not in ("next_open", "close"):
         raise ValueError(f"entry_mode must be next_open or close, got {cfg.entry_mode!r}")
+    if cfg.ambiguous not in ("stop", "target"):
+        raise ValueError(f"ambiguous must be stop or target, got {cfg.ambiguous!r}")
     next_open = cfg.entry_mode == "next_open"
     slip = cfg.slippage_ticks * cfg.tick
 
@@ -273,10 +280,15 @@ def run(df: pd.DataFrame, cfg: Config) -> dict:
                 if cfg.use_trail and trail is not None:
                     eff_stop = max(eff_stop, trail)
 
-                # Pessimistic ordering: if the bar spans both, assume the stop.
-                if l_ <= eff_stop:
+                hit_stop, hit_tgt = l_ <= eff_stop, h_ >= target
+                if hit_stop and hit_tgt:
+                    ambiguous += 1
+                    first = cfg.ambiguous
+                else:
+                    first = "stop" if hit_stop else ("target" if hit_tgt else None)
+                if first == "stop":
                     exit_px, exit_reason = eff_stop - slip, "stop"
-                elif h_ >= target:
+                elif first == "target":
                     exit_px, exit_reason = target - slip, "target"
                 elif bars_held >= eff_max:
                     exit_px, exit_reason = c_ - slip, "time"
@@ -290,9 +302,15 @@ def run(df: pd.DataFrame, cfg: Config) -> dict:
                 if cfg.use_trail and trail is not None:
                     eff_stop = min(eff_stop, trail)
 
-                if h_ >= eff_stop:
+                hit_stop, hit_tgt = h_ >= eff_stop, l_ <= target
+                if hit_stop and hit_tgt:
+                    ambiguous += 1
+                    first = cfg.ambiguous
+                else:
+                    first = "stop" if hit_stop else ("target" if hit_tgt else None)
+                if first == "stop":
                     exit_px, exit_reason = eff_stop + slip, "stop"
-                elif l_ <= target:
+                elif first == "target":
                     exit_px, exit_reason = target + slip, "target"
                 elif bars_held >= eff_max:
                     exit_px, exit_reason = c_ + slip, "time"
@@ -327,7 +345,9 @@ def run(df: pd.DataFrame, cfg: Config) -> dict:
                     entry_px, stop, target = open_position(side, c_, a_, is_strong)
                     trail, be_hit = None, False
 
-    return summarize(cfg.name, trades)
+    res = summarize(cfg.name, trades)
+    res["ambiguous"] = ambiguous
+    return res
 
 
 def summarize(name: str, trades: list) -> dict:
@@ -365,10 +385,12 @@ def load_ohlcv(path: str) -> pd.DataFrame:
     return df[["open", "high", "low", "close", "volume"]].astype(float)
 
 
-def run_all(df: pd.DataFrame, entry_mode: str = "next_open") -> list:
+def run_all(df: pd.DataFrame, entry_mode: str = "next_open",
+            ambiguous: str = "stop") -> list:
     rows = []
     for cfg in CONFIGS.values():
-        rows.append(run(df, replace(cfg, entry_mode=entry_mode)))
+        rows.append(run(df, replace(cfg, entry_mode=entry_mode,
+                                    ambiguous=ambiguous)))
     return rows
 
 
@@ -379,16 +401,19 @@ def main():
     ap.add_argument("--entry", choices=["next_open", "close"], default="next_open",
                     help="fill at next bar's open (default, realistic) or at the "
                          "signal bar's close (look-ahead; for comparison only)")
+    ap.add_argument("--ambiguous", choices=["stop", "target"], default="stop",
+                    help="when one bar spans both stop and target, which filled "
+                         "first (default stop = worst case)")
     ap.add_argument("--trades-out", metavar="PATH",
                     help="write every trade to this csv, for validate.py")
     args = ap.parse_args()
 
     df = load_ohlcv(args.csv)
     print(f"Loaded {len(df):,} bars  {df.index.min()} → {df.index.max()}")
-    print(f"Entry fill: {args.entry}")
+    print(f"Entry fill: {args.entry}   ambiguous bars resolved as: {args.ambiguous}")
     print()
 
-    rows = run_all(df, entry_mode=args.entry)
+    rows = run_all(df, entry_mode=args.entry, ambiguous=args.ambiguous)
 
     hdr = (f"{'Version':<22}{'N':>6}{'Net $':>12}{'PF':>8}{'Win%':>8}"
            f"{'Avg R':>8}{'SD R':>8}{'MaxDD $':>12}{'Long/Short':>14}")
@@ -401,7 +426,9 @@ def main():
     print()
     print("Exit reasons by version:")
     for r in rows:
-        print(f"  {r['name']:<22} {r.get('by_reason', {})}")
+        amb = r.get("ambiguous", 0)
+        print(f"  {r['name']:<22} {r.get('by_reason', {})}"
+              f"   [{amb} bar(s) spanned stop+target]")
 
     if args.trades_out:
         frames = []

@@ -56,12 +56,62 @@ Largest Losing Trade:
 Avg Bars in Winning Trades / Losing Trades:
 ```
 
+## Results on real data
+
+Tested on **SPY 5-minute bars, 165 sessions (2026-02-23 → 2026-10-16)**, real
+bars only (synthesized gap-fill bars dropped), next-bar-open fills.
+
+| | v1 | v2 | v3 |
+|---|---|---|---|
+| trades | 144 | 26 | 31 |
+| mean R | −0.405 | −0.179 | +0.058 |
+
+v3's `+0.058` on 31 trades is indistinguishable from zero. Three findings
+from `sweep.py`, in increasing order of how much they matter:
+
+**1. No filter earns its place.** Switching any single filter off leaves mean
+R flat or better. Removing the break-even stop is the largest single
+improvement (+0.183 R).
+
+**2. Nothing in the grid works.** All 144 cells have negative in-sample mean
+R. The best one degrades from −0.202 in-sample to −0.556 out-of-sample, and
+its deflated Sharpe is 0.000 against 144 trials.
+
+**3. The pattern is negative *before* costs.** Stripped of every filter, the
+raw 3-bar pattern gives 1,170 trades over 165 sessions at mean R −0.421,
+95% CI [−0.470, −0.370], `P(mean R ≤ 0) = 1.000`. Gross of all costs it is
+still −0.142. Breakeven win rate at a 1.25/2.0 ATR stop-target is 38.5%;
+observed is 17.4%.
+
+That third result is the one that settles it. A negative *gross* edge cannot
+be fixed by cheaper fills, a wider stop, or another filter — the signal does
+not work on this instrument and timeframe. Reproduce with:
+
+```bash
+python3 sweep.py ohlcv.csv --mode costs
+```
+
+Two caveats worth keeping: 165 sessions is below the ≥300 the protocol asks
+for, and this is one symbol on one timeframe. The finding is "no edge on SPY
+5-minute", not "no edge anywhere".
+
 ## Validating results
 
 ```bash
 python3 backtest.py ohlcv.csv --trades-out trades.csv
 python3 validate.py trades.csv --trials <variants you tried> --holdout 0.3
 ```
+
+`sweep.py` searches without fooling you:
+
+| mode | question it answers |
+|---|---|
+| `--mode costs` | Is the edge negative *before* costs? If so, stop here. |
+| `--mode ablation` | Does each filter earn its place, or just cost you trades? |
+| `--mode grid` | Ranks the grid, then deflates the winner by the trial count it counted itself. |
+
+Run `costs` first — it is the cheapest way to find out that no amount of
+filter tuning will help.
 
 `validate.py` answers the question the Strategy Tester doesn't:
 
@@ -88,7 +138,9 @@ Already on deck — pick the direction once we see v1/v2/v3 results:
 - **v4 Volatility-Regime** — run v2 logic in low-ATR regimes, v3 in high-ATR regimes (auto-switch).
 - **v5 Multi-Target** — scale out 50% at 1R, ride the rest with trail.
 - **v6 Time-of-Day** — bucket signals by hour, mute the worst-performing buckets.
-- **v7 Bar-Pattern-Only** — drop EMA/VWAP/HTF filters to isolate the raw 3-bar edge.
+- ~~**v7 Bar-Pattern-Only**~~ — done, via `sweep.py --mode ablation`. The raw
+  pattern is negative gross of costs on SPY 5-min, so this is answered rather
+  than pending.
 
 ## File layout
 
@@ -98,6 +150,7 @@ strategies/thor-3bar-reversal/
   v2.pine      — Selective (stricter signal, better R:R)
   v3.pine      — Trend-Strength (slope-gated, adaptive target, trailing)
   backtest.py  — approximate Python replica of v1/v2/v3
+  sweep.py     — cost decomposition, filter ablation, deflated grid search
   validate.py  — is it an edge or is it luck
   stats.py     — bootstrap, deflated Sharpe, power (no scipy)
   PROTOCOL.md  — the standard a result has to clear
