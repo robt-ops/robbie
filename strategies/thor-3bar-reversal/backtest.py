@@ -3,6 +3,7 @@ Python sim of THOR 3-Bar Reversal v1/v2/v3.
 
 Usage:
     python3 backtest.py path/to/ohlcv.csv
+    python3 backtest.py ohlcv.csv --trades-out trades.csv   # then validate.py
 
 CSV format (header required):
     timestamp,open,high,low,close,volume
@@ -16,11 +17,12 @@ Notes:
       - Commissions/slippage are flat percent, not TV's model.
 
     Intended for *directional comparison* between v1/v2/v3, not for
-    publishing absolute results.
+    publishing absolute results. A result here is not evidence of an edge
+    until validate.py says the sample supports it — see PROTOCOL.md.
 """
 
-import sys
-from dataclasses import dataclass, field
+import argparse
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import numpy as np
@@ -82,6 +84,8 @@ class Config:
     max_bars_strong: int = 16
     use_trail: bool = False
     trail_atr: float = 1.5
+    # fill model
+    entry_mode: str = "next_open"   # "next_open" (realistic) | "close" (look-ahead)
     # cost model
     commission_pct: float = 0.0001  # 0.01%
     slippage_ticks: float = 2.0
@@ -159,10 +163,13 @@ def run(df: pd.DataFrame, cfg: Config) -> dict:
     ema_long = c > df["ema"]
     ema_short = c < df["ema"]
     vol_ok = df["volume"] > df["vol_sma"] * cfg.vol_mult
-    vwap_long = (~cfg.use_vwap) | (c > df["vwap"])
-    vwap_short = (~cfg.use_vwap) | (c < df["vwap"])
-    htf_long = (~cfg.use_htf) | (df["htf_close"] > df["htf_ema"])
-    htf_short = (~cfg.use_htf) | (df["htf_close"] < df["htf_ema"])
+    # `~` on a Python bool gives an int (~True == -2), which ORs into an
+    # always-true mask and silently disables the filter. Branch instead.
+    all_true = pd.Series(True, index=df.index)
+    vwap_long = (c > df["vwap"]) if cfg.use_vwap else all_true
+    vwap_short = (c < df["vwap"]) if cfg.use_vwap else all_true
+    htf_long = (df["htf_close"] > df["htf_ema"]) if cfg.use_htf else all_true
+    htf_short = (df["htf_close"] < df["htf_ema"]) if cfg.use_htf else all_true
 
     extra_long = pd.Series(True, index=df.index)
     extra_short = pd.Series(True, index=df.index)
@@ -190,15 +197,29 @@ def run(df: pd.DataFrame, cfg: Config) -> dict:
     long_sig = long_pattern & body_ok & ema_long & vol_ok & vwap_long & htf_long & extra_long
     short_sig = short_pattern & body_ok & ema_short & vol_ok & vwap_short & htf_short & extra_short
 
-    # Walk forward
+    # Walk forward.
+    #
+    # Entry defaults to the OPEN OF THE BAR AFTER the signal bar, which is
+    # what Pine's strategy.entry does unless process_orders_on_close is set.
+    # "close" fills at the close of the signal bar instead — that close is
+    # the thing that produced the signal, so it is not a fill you could have
+    # got. It is kept only to measure how much of a result comes from the
+    # look-ahead rather than from the edge.
     trades = []
     pos = 0
-    entry_px = entry_atr = entry_idx = 0.0
+    entry_px = entry_atr = 0.0
+    entry_idx = 0
     stop = target = 0.0
     trail = None
     be_hit = False
     strong = False
+    pending = 0                 # order armed by the previous bar's signal
+    pending_atr = 0.0
+    pending_strong = False
 
+    if cfg.entry_mode not in ("next_open", "close"):
+        raise ValueError(f"entry_mode must be next_open or close, got {cfg.entry_mode!r}")
+    next_open = cfg.entry_mode == "next_open"
     slip = cfg.slippage_ticks * cfg.tick
 
     times = df.index.to_list()
@@ -207,119 +228,112 @@ def run(df: pd.DataFrame, cfg: Config) -> dict:
     ls = long_sig.to_numpy()
     ss = short_sig.to_numpy()
 
+    def is_strong_trend(side: int, i: int) -> bool:
+        sl = htf_slope_arr[i] if htf_slope_arr is not None else float("nan")
+        return bool(
+            cfg.strong_slope_pct and not np.isnan(sl)
+            and (sl >= cfg.strong_slope_pct if side == 1 else sl <= -cfg.strong_slope_pct)
+        )
+
+    def open_position(side: int, px: float, a_: float, is_strong: bool):
+        """Entry price plus the stop/target sized off the signal-bar ATR."""
+        eff_tgt = cfg.target_atr + (cfg.target_boost_atr if is_strong else 0.0)
+        if side == 1:
+            e = px + slip
+            return e, e - a_ * cfg.risk_atr, e + a_ * eff_tgt
+        e = px - slip
+        return e, e + a_ * cfg.risk_atr, e - a_ * eff_tgt
+
     for i in range(len(df)):
         o_, h_, l_, c_, a_ = arr[i]
 
-        if pos == 0:
-            if ls[i] and not np.isnan(a_):
-                pos = 1
-                entry_px = c_ + slip
-                entry_atr = a_
-                entry_idx = i
-                stop = entry_px - a_ * cfg.risk_atr
-                strong = bool(cfg.strong_slope_pct and htf_slope_arr is not None
-                              and not np.isnan(htf_slope_arr[i])
-                              and htf_slope_arr[i] >= cfg.strong_slope_pct)
-                eff_tgt = cfg.target_atr + (cfg.target_boost_atr if strong else 0.0)
-                target = entry_px + a_ * eff_tgt
-                trail = None
-                be_hit = False
-            elif ss[i] and not np.isnan(a_):
-                pos = -1
-                entry_px = c_ - slip
-                entry_atr = a_
-                entry_idx = i
-                stop = entry_px + a_ * cfg.risk_atr
-                strong = bool(cfg.strong_slope_pct and htf_slope_arr is not None
-                              and not np.isnan(htf_slope_arr[i])
-                              and htf_slope_arr[i] <= -cfg.strong_slope_pct)
-                eff_tgt = cfg.target_atr + (cfg.target_boost_atr if strong else 0.0)
-                target = entry_px - a_ * eff_tgt
-                trail = None
-                be_hit = False
-            continue
+        # 1. Fill the order armed by the previous bar.
+        if pos == 0 and pending != 0:
+            pos, entry_atr, strong = pending, pending_atr, pending_strong
+            entry_idx = i
+            entry_px, stop, target = open_position(pos, o_, entry_atr, strong)
+            trail, be_hit, pending = None, False, 0
 
-        # In a position — process exits on this bar
-        bars_held = i - entry_idx
-        eff_max = cfg.max_bars_strong if strong else cfg.max_bars_hold
-
-        if pos == 1:
-            # Break-even latch
-            if cfg.use_be and bars_held >= 1 and h_ >= entry_px + entry_atr * cfg.be_trigger:
-                be_hit = True
-            # Trailing
-            if cfg.use_trail and h_ >= entry_px + entry_atr * 1.0:
-                candidate = h_ - entry_atr * cfg.trail_atr
-                trail = candidate if trail is None else max(trail, candidate)
-            eff_stop = entry_px if (cfg.use_be and be_hit) else stop
-            if cfg.use_trail and trail is not None:
-                eff_stop = max(eff_stop, trail)
-
-            # Pessimistic fill order: stop before target if both hit
+        # 2. Exits for this bar. In next_open mode the entry bar counts: you
+        #    are filled at its open, so its own range can take you out.
+        if pos != 0:
+            bars_held = i - entry_idx
+            eff_max = cfg.max_bars_strong if strong else cfg.max_bars_hold
+            risk = entry_atr * cfg.risk_atr
             exit_px = None
             exit_reason = None
-            if l_ <= eff_stop:
-                exit_px = eff_stop - slip
-                exit_reason = "stop"
-            elif h_ >= target:
-                exit_px = target - slip
-                exit_reason = "target"
-            elif bars_held >= eff_max:
-                exit_px = c_ - slip
-                exit_reason = "time"
+
+            if pos == 1:
+                if cfg.use_be and h_ >= entry_px + entry_atr * cfg.be_trigger:
+                    be_hit = True
+                if cfg.use_trail and h_ >= entry_px + entry_atr * 1.0:
+                    candidate = h_ - entry_atr * cfg.trail_atr
+                    trail = candidate if trail is None else max(trail, candidate)
+                eff_stop = entry_px if (cfg.use_be and be_hit) else stop
+                if cfg.use_trail and trail is not None:
+                    eff_stop = max(eff_stop, trail)
+
+                # Pessimistic ordering: if the bar spans both, assume the stop.
+                if l_ <= eff_stop:
+                    exit_px, exit_reason = eff_stop - slip, "stop"
+                elif h_ >= target:
+                    exit_px, exit_reason = target - slip, "target"
+                elif bars_held >= eff_max:
+                    exit_px, exit_reason = c_ - slip, "time"
+            else:
+                if cfg.use_be and l_ <= entry_px - entry_atr * cfg.be_trigger:
+                    be_hit = True
+                if cfg.use_trail and l_ <= entry_px - entry_atr * 1.0:
+                    candidate = l_ + entry_atr * cfg.trail_atr
+                    trail = candidate if trail is None else min(trail, candidate)
+                eff_stop = entry_px if (cfg.use_be and be_hit) else stop
+                if cfg.use_trail and trail is not None:
+                    eff_stop = min(eff_stop, trail)
+
+                if h_ >= eff_stop:
+                    exit_px, exit_reason = eff_stop + slip, "stop"
+                elif l_ <= target:
+                    exit_px, exit_reason = target + slip, "target"
+                elif bars_held >= eff_max:
+                    exit_px, exit_reason = c_ + slip, "time"
 
             if exit_px is not None:
-                pnl = (exit_px - entry_px) - (entry_px + exit_px) * cfg.commission_pct
+                gross = (exit_px - entry_px) if pos == 1 else (entry_px - exit_px)
+                pnl = gross - (entry_px + exit_px) * cfg.commission_pct
+                entry_time = times[entry_idx]
                 trades.append({
-                    "side": "long",
-                    "entry_time": times[int(entry_idx)],
+                    "side": "long" if pos == 1 else "short",
+                    "entry_time": entry_time,
                     "exit_time": times[i],
+                    "session": entry_time.date(),
                     "entry": entry_px, "exit": exit_px,
-                    "pnl": pnl, "bars": bars_held, "reason": exit_reason,
+                    "pnl": pnl,
+                    "r": pnl / risk if risk > 0 else np.nan,
+                    "bars": bars_held, "reason": exit_reason,
                     "strong": strong,
                 })
-                pos = 0; trail = None; be_hit = False; strong = False
+                pos = 0
+                trail, be_hit, strong = None, False, False
 
-        else:  # pos == -1
-            if cfg.use_be and bars_held >= 1 and l_ <= entry_px - entry_atr * cfg.be_trigger:
-                be_hit = True
-            if cfg.use_trail and l_ <= entry_px - entry_atr * 1.0:
-                candidate = l_ + entry_atr * cfg.trail_atr
-                trail = candidate if trail is None else min(trail, candidate)
-            eff_stop = entry_px if (cfg.use_be and be_hit) else stop
-            if cfg.use_trail and trail is not None:
-                eff_stop = min(eff_stop, trail)
-
-            exit_px = None
-            exit_reason = None
-            if h_ >= eff_stop:
-                exit_px = eff_stop + slip
-                exit_reason = "stop"
-            elif l_ <= target:
-                exit_px = target + slip
-                exit_reason = "target"
-            elif bars_held >= eff_max:
-                exit_px = c_ + slip
-                exit_reason = "time"
-
-            if exit_px is not None:
-                pnl = (entry_px - exit_px) - (entry_px + exit_px) * cfg.commission_pct
-                trades.append({
-                    "side": "short",
-                    "entry_time": times[int(entry_idx)],
-                    "exit_time": times[i],
-                    "entry": entry_px, "exit": exit_px,
-                    "pnl": pnl, "bars": bars_held, "reason": exit_reason,
-                    "strong": strong,
-                })
-                pos = 0; trail = None; be_hit = False; strong = False
+        # 3. Arm an order off this bar's signal.
+        if pos == 0 and pending == 0 and not np.isnan(a_):
+            side = 1 if ls[i] else (-1 if ss[i] else 0)
+            if side != 0:
+                is_strong = is_strong_trend(side, i)
+                if next_open:
+                    pending, pending_atr, pending_strong = side, a_, is_strong
+                else:
+                    pos, entry_atr, strong, entry_idx = side, a_, is_strong, i
+                    entry_px, stop, target = open_position(side, c_, a_, is_strong)
+                    trail, be_hit = None, False
 
     return summarize(cfg.name, trades)
 
 
 def summarize(name: str, trades: list) -> dict:
     if not trades:
-        return {"name": name, "n": 0, "net": 0, "pf": 0, "win%": 0, "avg": 0, "maxdd": 0}
+        return {"name": name, "n": 0, "net": 0, "pf": 0, "win%": 0, "avg": 0,
+                "maxdd": 0, "avg_r": 0, "sd_r": 0, "trades": pd.DataFrame()}
     t = pd.DataFrame(trades)
     pnl = t["pnl"]
     wins = pnl[pnl > 0].sum()
@@ -334,37 +348,76 @@ def summarize(name: str, trades: list) -> dict:
         "win%": (pnl > 0).mean() * 100,
         "avg": pnl.mean(),
         "maxdd": dd,
+        "avg_r": t["r"].mean(),
+        "sd_r": t["r"].std(ddof=1) if len(t) > 1 else 0.0,
+        "trades": t,
         "longs": (t["side"] == "long").sum(),
         "shorts": (t["side"] == "short").sum(),
         "by_reason": t["reason"].value_counts().to_dict(),
     }
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("usage: python3 backtest.py path/to/ohlcv.csv")
-        sys.exit(1)
-    path = sys.argv[1]
+def load_ohlcv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     df.columns = [c.lower() for c in df.columns]
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df = df.set_index("timestamp").sort_index()
-    df = df[["open", "high", "low", "close", "volume"]].astype(float)
+    return df[["open", "high", "low", "close", "volume"]].astype(float)
+
+
+def run_all(df: pd.DataFrame, entry_mode: str = "next_open") -> list:
+    rows = []
+    for cfg in CONFIGS.values():
+        rows.append(run(df, replace(cfg, entry_mode=entry_mode)))
+    return rows
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("csv", help="OHLCV csv: timestamp,open,high,low,close,volume")
+    ap.add_argument("--entry", choices=["next_open", "close"], default="next_open",
+                    help="fill at next bar's open (default, realistic) or at the "
+                         "signal bar's close (look-ahead; for comparison only)")
+    ap.add_argument("--trades-out", metavar="PATH",
+                    help="write every trade to this csv, for validate.py")
+    args = ap.parse_args()
+
+    df = load_ohlcv(args.csv)
     print(f"Loaded {len(df):,} bars  {df.index.min()} → {df.index.max()}")
+    print(f"Entry fill: {args.entry}")
     print()
 
-    rows = []
-    for key, cfg in CONFIGS.items():
-        rows.append(run(df, cfg))
+    rows = run_all(df, entry_mode=args.entry)
 
-    print(f"{'Version':<22}{'N':>6}{'Net $':>12}{'PF':>8}{'Win%':>8}{'Avg $':>10}{'MaxDD $':>12}{'Long/Short':>14}")
+    hdr = (f"{'Version':<22}{'N':>6}{'Net $':>12}{'PF':>8}{'Win%':>8}"
+           f"{'Avg R':>8}{'SD R':>8}{'MaxDD $':>12}{'Long/Short':>14}")
+    print(hdr)
     for r in rows:
         ls_short = f"{r.get('longs', 0)}/{r.get('shorts', 0)}"
-        print(f"{r['name']:<22}{r['n']:>6}{r['net']:>12.2f}{r['pf']:>8.2f}{r['win%']:>8.1f}{r['avg']:>10.2f}{r['maxdd']:>12.2f}{ls_short:>14}")
+        print(f"{r['name']:<22}{r['n']:>6}{r['net']:>12.2f}{r['pf']:>8.2f}"
+              f"{r['win%']:>8.1f}{r['avg_r']:>8.3f}{r['sd_r']:>8.3f}"
+              f"{r['maxdd']:>12.2f}{ls_short:>14}")
     print()
     print("Exit reasons by version:")
     for r in rows:
         print(f"  {r['name']:<22} {r.get('by_reason', {})}")
+
+    if args.trades_out:
+        frames = []
+        for r in rows:
+            t = r["trades"]
+            if len(t):
+                t = t.copy()
+                t.insert(0, "variant", r["name"])
+                frames.append(t)
+        if frames:
+            pd.concat(frames, ignore_index=True).to_csv(args.trades_out, index=False)
+            print()
+            print(f"Wrote trades → {args.trades_out}")
+            print(f"Next: python3 validate.py {args.trades_out}")
+        else:
+            print("\nNo trades — nothing written.")
 
 
 if __name__ == "__main__":
