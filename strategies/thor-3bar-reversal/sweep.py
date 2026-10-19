@@ -14,6 +14,20 @@ Two modes:
                     no cost tuning will save it and no filter search is
                     worth running.
 
+  --mode attribution
+                    The one that matters. Splits mean R into the entry
+                    signal, each exit rule, and costs, so you can see which
+                    component is losing the money. Takes one or many csvs.
+
+                    The entry signal is measured through a pure bracket
+                    (no break-even stop, no time stop) gross of costs: if
+                    that is zero, the signal carries no information and no
+                    filter will give it any.
+
+  --mode symbols    Run the same rules across several instruments and pool
+                    them. One symbol can be luck; a sign that holds across
+                    a basket is a property of the rules. Pass several csvs.
+
   --mode grid       Enumerate the filter/parameter grid, rank the variants,
                     and then deflate the winner by the number of variants
                     tried — which this script counts for you, because that
@@ -123,12 +137,204 @@ def mean_r_on(t: pd.DataFrame, keep: set):
     return (float(sub.mean()) if len(sub) else np.nan), len(sub)
 
 
+PATTERN_ONLY = {"use_ema": False, "use_vwap": False, "use_htf": False,
+                "vol_mult": 0.0, "min_body_pct": 0.0}
+
+
+def run_symbols(args) -> None:
+    """Same rules, many instruments, pooled with clustering respected."""
+    import os
+
+    base = CONFIGS[args.base]
+    variants = [("with filters", {}), ("pattern only", PATTERN_ONLY)]
+    rows, pooled = [], {k: [] for k, _ in variants}
+
+    for path in args.csv:
+        sym = os.path.splitext(os.path.basename(path))[0].upper()
+        df = load_ohlcv(path)
+        row = {"symbol": sym, "sessions": df.index.normalize().nunique()}
+        for vlabel, ov in variants:
+            d = evaluate(df, base, vlabel, ov, args.entry)
+            row[vlabel] = d
+            t = d["trades"]
+            if len(t):
+                t = t.copy()
+                t["symbol"] = sym
+                # Cluster on symbol+session: two symbols on one day are not
+                # one bet, and one symbol across a day is not many.
+                t["block"] = sym + "|" + t["session"].astype(str)
+                pooled[vlabel].append(t)
+        rows.append(row)
+
+    print(f"\n{len(args.csv)} instruments   base {base.name}   entry {args.entry}")
+    print(f"\n{'symbol':<8}{'sess':>6}"
+          f"{'filtered N':>12}{'mean R':>9}"
+          f"{'pattern N':>12}{'mean R':>9}")
+    print("─" * 60)
+    for row in rows:
+        f_, p_ = row["with filters"], row["pattern only"]
+        fm = "—" if np.isnan(f_["mean_r"]) else f"{f_['mean_r']:+.3f}"
+        pm = "—" if np.isnan(p_["mean_r"]) else f"{p_['mean_r']:+.3f}"
+        print(f"{row['symbol']:<8}{row['sessions']:>6}"
+              f"{f_['n']:>12}{fm:>9}{p_['n']:>12}{pm:>9}")
+
+    print("\n" + "─" * 60)
+    print("POOLED")
+    for vlabel, _ in variants:
+        if not pooled[vlabel]:
+            continue
+        t = pd.concat(pooled[vlabel], ignore_index=True)
+        r = t["r"].dropna()
+        b = stats.block_bootstrap_mean(r.to_numpy(), t.loc[r.index, "block"],
+                                       n_boot=5000, seed=0)
+        n_pos = sum(1 for row in rows
+                    if not np.isnan(row[vlabel]["mean_r"])
+                    and row[vlabel]["mean_r"] > 0)
+        print(f"\n  {vlabel}")
+        print(f"    {b['n']:,} trades over {b['n_blocks']:,} symbol-sessions")
+        print(f"    mean R {b['mean']:+.4f}   95% CI "
+              f"[{b['ci_lo']:+.4f}, {b['ci_hi']:+.4f}]   SE {b['se']:.4f}")
+        print(f"    P(mean R ≤ 0) = {b['p_le_zero']:.3f}")
+        print(f"    positive on {n_pos} of {len(rows)} instruments")
+
+    print()
+    print("  A sign that flips around zero across the basket is noise. One that"
+          "\n  holds on every instrument is a property of the rules —"
+          " in whichever direction.")
+    print()
+
+
+# The ladder: each rung adds one component to the one above it, so the
+# difference between consecutive rungs is that component's contribution.
+LADDER = [
+    ("entry signal (pure bracket, gross)",
+     {"use_be": False, "max_bars_hold": 10 ** 6,
+      "commission_pct": 0.0, "slippage_ticks": 0.0}),
+    ("+ break-even stop",
+     {"max_bars_hold": 10 ** 6, "commission_pct": 0.0, "slippage_ticks": 0.0}),
+    ("+ time stop",
+     {"commission_pct": 0.0, "slippage_ticks": 0.0}),
+    ("+ costs  = as configured", {}),
+]
+
+
+def pooled_r(dfs: dict, base, overrides: dict, entry_mode: str,
+             n_boot: int = 4000) -> dict:
+    """Pool one config's trades across instruments, clustering on symbol+session."""
+    frames = []
+    for sym, df in dfs.items():
+        t = run(df, replace(base, entry_mode=entry_mode, **overrides))["trades"]
+        if not len(t):
+            continue
+        t = t.copy()
+        t["block"] = sym + "|" + t["session"].astype(str)
+        frames.append(t)
+    if not frames:
+        return {"n": 0, "mean": np.nan}
+    t = pd.concat(frames, ignore_index=True)
+    r = t["r"].dropna()
+    out = stats.block_bootstrap_mean(r.to_numpy(), t.loc[r.index, "block"],
+                                     n_boot=n_boot, seed=0)
+    out["win"] = float((t["pnl"] > 0).mean() * 100)
+    return out
+
+
+def run_attribution(args) -> None:
+    import os
+
+    base = CONFIGS[args.base]
+    # Strip the filters: attribution is about the signal and the exits, and
+    # the filters only change which signals you take, not what they are worth.
+    base = replace(base, **PATTERN_ONLY)
+
+    dfs = {os.path.splitext(os.path.basename(p))[0].upper(): load_ohlcv(p)
+           for p in args.csv}
+    sessions = sum(df.index.normalize().nunique() for df in dfs.values())
+    print(f"\n{len(dfs)} instrument(s)   {sessions} symbol-sessions   "
+          f"base {CONFIGS[args.base].name} with filters stripped")
+    print(f"entry {args.entry}   signals: raw 3-bar pattern\n")
+
+    levels = [(label, pooled_r(dfs, base, ov, args.entry))
+              for label, ov in LADDER]
+
+    print(f"{'component':<38}{'N':>8}{'mean R':>10}{'Δ':>9}{'win%':>7}"
+          f"{'95% CI':>20}")
+    print("─" * 92)
+    prev = None
+    for label, d in levels:
+        if d["n"] == 0:
+            print(f"{label:<38}{'—':>8}")
+            continue
+        delta = "" if prev is None else f"{d['mean'] - prev:+.3f}"
+        ci = f"[{d['ci_lo']:+.3f}, {d['ci_hi']:+.3f}]"
+        print(f"{label:<38}{d['n']:>8,}{d['mean']:>+10.3f}{delta:>9}"
+              f"{d['win']:>7.1f}{ci:>20}")
+        prev = d["mean"]
+
+    # Same pure bracket, opposite side. A signal with real information
+    # loses when inverted; one with none is flat both ways.
+    inverted = pooled_r(dfs, base, {**LADDER[0][1], "invert": True}, args.entry)
+    if inverted["n"]:
+        ci = f"[{inverted['ci_lo']:+.3f}, {inverted['ci_hi']:+.3f}]"
+        print(f"{'  (same bracket, inverted signal)':<38}{inverted['n']:>8,}"
+              f"{inverted['mean']:>+10.3f}{'':>9}{inverted['win']:>7.1f}{ci:>20}")
+
+    signal = levels[0][1]
+    breakeven = 1.0 / (1.0 + base.target_atr / base.risk_atr) * 100
+    print(f"\nBreakeven win rate for the {base.risk_atr:g}/{base.target_atr:g}"
+          f" ATR bracket: {breakeven:.1f}%")
+
+    # What the signal would have to beat to be worth trading at all.
+    cost_drag = abs(levels[-1][1]["mean"] - levels[-2][1]["mean"]) \
+        if levels[-1][1]["n"] and levels[-2][1]["n"] else 0.0
+
+    print("\nReading it:")
+    if signal["n"]:
+        spans_zero = signal["ci_lo"] <= 0 <= signal["ci_hi"]
+        too_small = abs(signal["mean"]) < cost_drag
+        flat_inverted = (inverted["n"] and
+                         inverted["ci_lo"] <= 0 <= inverted["ci_hi"])
+        if spans_zero or too_small:
+            print(f"  • The entry signal is {signal['mean']:+.3f} R"
+                  f" (CI {signal['ci_lo']:+.3f} to {signal['ci_hi']:+.3f}),"
+                  f" against {cost_drag:.3f} R of costs.")
+            print("    It carries no tradeable directional information, and no"
+                  " filter on top of\n    it can create any — a filter selects"
+                  " signals, it does not improve them.")
+            if flat_inverted:
+                print(f"    Inverting it gives {inverted['mean']:+.3f} R, also"
+                      " flat, which confirms the\n    signal is noise rather"
+                      " than a backwards edge. Replace it, don't tune it.")
+            elif inverted["n"] and inverted["mean"] > cost_drag:
+                print(f"    But inverted it gives {inverted['mean']:+.3f} R,"
+                      " which clears costs. Worth pursuing\n    as its own"
+                      " pre-registered hypothesis on fresh data.")
+        else:
+            side = "positive" if signal["mean"] > 0 else "negative"
+            print(f"  • The entry signal is {side} at {signal['mean']:+.3f} R,"
+                  f" clear of both zero and the\n    {cost_drag:.3f} R cost"
+                  " drag.")
+
+    worst = min(
+        ((levels[i][0], levels[i][1]["mean"] - levels[i - 1][1]["mean"])
+         for i in range(1, len(levels))
+         if levels[i][1]["n"] and levels[i - 1][1]["n"]),
+        key=lambda kv: kv[1], default=None)
+    if worst and worst[1] < -0.01:
+        print(f"  • Biggest single loss: {worst[0].lstrip('+ ')}"
+              f" at {worst[1]:+.3f} R per trade. Fix that before anything else.")
+    print()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("csv")
-    ap.add_argument("--mode", choices=["ablation", "grid", "costs"],
+    ap.add_argument("csv", nargs="+",
+                    help="OHLCV csv. --mode symbols takes several; the other "
+                         "modes use the first.")
+    ap.add_argument("--mode", choices=["ablation", "grid", "costs", "symbols",
+                                       "attribution"],
                     default="ablation")
     ap.add_argument("--base", default="v1", choices=list(CONFIGS),
                     help="config the sweep starts from (default v1)")
@@ -143,7 +349,14 @@ def main() -> None:
                     help="write every variant's trades for validate.py")
     args = ap.parse_args()
 
-    df = load_ohlcv(args.csv)
+    if args.mode == "symbols":
+        run_symbols(args)
+        return
+    if args.mode == "attribution":
+        run_attribution(args)
+        return
+
+    df = load_ohlcv(args.csv[0])
     base = CONFIGS[args.base]
     sessions_total = df.index.normalize().nunique()
     print(f"\n{len(df):,} bars   {sessions_total} sessions   "

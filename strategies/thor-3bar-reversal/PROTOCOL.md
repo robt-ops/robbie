@@ -11,7 +11,29 @@ assumptions somewhere you are not looking.
 
 ---
 
-## 1. Pre-register, before you look
+## 1. Attribute before you tune
+
+Before pre-registering a search, find out whether there is anything to search
+for. Measure the entry signal on its own — through a pure bracket, no
+break-even stop, no time stop, gross of all costs — and compare it against the
+cost drag it would have to clear:
+
+```bash
+python3 sweep.py bars/*.csv --mode attribution
+```
+
+If that interval contains zero, or the edge is smaller than costs, the signal
+carries no tradeable information and **no filter can give it any**: a filter
+selects signals, it does not improve them. Replacing the signal is the only
+move. Skipping this step is how a dead signal absorbs weeks of filter tuning.
+
+Test the signal inverted in the same breath. Flat both ways is noise;
+reliably negative is a backwards edge worth pre-registering on fresh data.
+
+Then attribute the rest. Each exit rule gets its own line, and any rule
+costing you more than it returns goes before anything else is tuned.
+
+## 2. Pre-register, before you look
 
 Write this down first. Anything decided *after* seeing results is fitting,
 not testing.
@@ -37,7 +59,7 @@ Regime and time-of-day filters are themselves free parameters. Three regime
 definitions × five time windows is fifteen more trials, and one of them will
 look good by chance.
 
-## 2. Fill model
+## 3. Fill model
 
 | | |
 |---|---|
@@ -57,7 +79,7 @@ python3 backtest.py ohlcv.csv --entry next_open
 python3 backtest.py ohlcv.csv --entry close     # the difference is the leak
 ```
 
-## 3. Pine settings
+## 4. Pine settings
 
 | Setting | Why | v1 / v2 / v3 |
 |---|---|---|
@@ -76,14 +98,14 @@ Two things are **not** settled by that table and are worth knowing:
 - **Repainting signals.** Anything evaluated on a bar that is still forming
   can flip before the close. Confirm signals on closed bars only.
 
-## 4. Data quality
+## 5. Data quality
 
 Split-adjusted. RTH only. Drop halt bars. Filter prints more than X ATR from
 the prior close. Watch the opening bar specifically — after-hours volume
 contaminates it, and the opening bar is where a disproportionate share of
 intraday signals fire.
 
-## 5. Metric and sample size
+## 6. Metric and sample size
 
 **Power against mean R per trade (expectancy), not win rate.** Breakout and
 ORB systems win 35–45% of the time and make their money on payoff asymmetry;
@@ -114,7 +136,7 @@ clustering: block SE is 1.16× the iid SE  →  917 trades ≈ 685 independent b
 If the block interval is much wider, the clustering is real and the naive
 confidence interval was lying to you.
 
-## 6. Selection
+## 7. Selection
 
 Pre-registration alone is not enough; you still picked a winner. Deflate it.
 `validate.py` reports the deflated Sharpe ratio: the probability the true
@@ -132,7 +154,7 @@ winner is consistent with having been picked out of noise.
 variant you ran, not just the survivors. Estimated from three, it is itself
 noisy — treat the number as indicative at that count.
 
-## 7. Walk-forward
+## 8. Walk-forward
 
 ```bash
 python3 validate.py trades.csv --trials 200 --holdout 0.3
@@ -142,7 +164,7 @@ python3 validate.py trades.csv --trials 200 --holdout 0.3
 in-sample and stops being evidence. If you have already looked twice, you
 need new data, not a new split.
 
-## 8. Paper, then size
+## 9. Paper, then size
 
 ≥100 live or paper trades. Compare realized slippage against the model
 before sizing up. If realized slippage is materially worse than assumed, the
@@ -153,6 +175,7 @@ backtest was measuring a market that doesn't exist.
 ## Running it
 
 ```bash
+python3 sweep.py bars/*.csv --mode attribution        # is there a signal at all
 python3 backtest.py ohlcv.csv --trades-out trades.csv
 python3 validate.py trades.csv --trials <honest count> --holdout 0.3
 ```

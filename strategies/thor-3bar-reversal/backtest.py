@@ -90,6 +90,7 @@ class Config:
     # fill model
     entry_mode: str = "next_open"   # "next_open" (realistic) | "close" (look-ahead)
     ambiguous: str = "stop"         # bar spans stop AND target: which filled first
+    invert: bool = False            # trade the opposite side of every signal
     # cost model
     commission_pct: float = 0.0001  # 0.01%
     slippage_ticks: float = 2.0
@@ -200,6 +201,9 @@ def run(df: pd.DataFrame, cfg: Config) -> dict:
 
     long_sig = long_pattern & body_ok & ema_long & vol_ok & vwap_long & htf_long & extra_long
     short_sig = short_pattern & body_ok & ema_short & vol_ok & vwap_short & htf_short & extra_short
+
+    if cfg.invert:
+        long_sig, short_sig = short_sig, long_sig
 
     # Walk forward.
     #
