@@ -23,8 +23,63 @@ mean of $0.0362. Establishing an effect that size at 80% power needs
 **≈32,490 trades**. One instrument trading once a day generates ~250 a year,
 so the required sample is ~129 years.
 
-No filter fixes this. No longer backtest fixes this. The only lever is **more
-simultaneous instruments.**
+No filter fixes this. No longer backtest fixes this.
+
+**CORRECTION (measured after this was first written).** I originally wrote
+that "the only lever is more simultaneous instruments." That is wrong. The
+required sample is
+
+```
+n  ~  (2.49 * SD / mu)^2        and what you actually have is n_effective
+```
+
+so there are **three** levers, not one — raise `mu`, cut `SD`, or raise
+`n_effective` — and breadth only touches the last.
+
+**Exit geometry is comparable to breadth, and it is free.** Measured on the
+QQQ ORB, 909 trades, varying only the target:
+
+| target | mean R | SD R | win% | n for a 0.10R edge | n for its *own* edge |
+|---|---|---|---|---|---|
+| 1R | −0.070 | 1.026 | 49.2 | **653** | 1,325 |
+| 2R | −0.043 | 1.424 | 35.0 | 1,257 | 6,770 |
+| 3R | −0.006 | 1.699 | 30.1 | 1,790 | 547,933 |
+| 5R | +0.078 | 2.110 | 27.1 | 2,762 | 4,481 |
+| 10R | +0.094 | 2.465 | 25.4 | 3,766 | 4,234 |
+| hold-to-close | +0.167 | 3.160 | 25.2 | 6,191 | **2,221** |
+
+Tightening the target cuts SD 3.1× and the sample needed for a *fixed* 0.10R
+edge by **9.5×** — against 20× for going from 1 to 20 instruments. Same order
+of magnitude, no extra data required.
+
+**But you cannot simply tighten the target, because for a momentum strategy
+the edge lives in the same tail as the variance.** Look at the mean column:
+it falls monotonically as the target tightens, and goes *negative* at 1R and
+2R. Truncating the right tail removes the variance and the edge together. For
+detecting *this strategy's own* edge, hold-to-close (n=2,221) beats a 10R
+target (n=4,234) — the mean grows faster than SD.
+
+So the lever is the **ratio** `mu/SD`, not SD alone. Testing several exit
+geometries and keeping the best `mu/SD` is cheap and worth doing first; a
+blanket "add a tight target to cut SD" is wrong and would have destroyed the
+only positive configuration here.
+
+**And breadth delivers less n_effective than it looks.** Same-day positions
+are correlated, so they must be clustered. How much it costs depends on the
+design:
+
+- A **fixed diversified basket with intraday-staggered entries** (my 11-symbol
+  3-bar data, 10,671 trades over 138 sessions): day-clustered SE is only
+  **1.13×** the iid SE, so n_effective ≈ 8,363 of 10,671 — a 22% haircut.
+- A **top-N-same-signal cross-section** (e.g. the day's 20 highest
+  relative-volume names) is far worse, because every name is selected by the
+  same signal in the same market-wide move. An independent replication of that
+  design reported a day-clustered t of **1.08** on 5,017 trades, with a 95% CI
+  straddling zero.
+
+Breadth is **necessary but not sufficient**, and its value falls as the
+same-day selections become more correlated. Always report the day-clustered
+interval, never the per-trade one.
 
 So: before writing any signal code, compute how many trades the design can
 possibly generate per year, and what per-trade variance you expect. If the
