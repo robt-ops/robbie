@@ -1,0 +1,30 @@
+# THOR Auction Imbalance — watchlist universe
+# Paste into thinkorswim: Watchlist gear -> Import, or add symbols manually.
+#
+# Core index / tape
+SPY
+QQQ
+IWM
+# Priority semis
+NVDA
+AMD
+TSM
+# Broader liquid semiconductor complex
+AVGO
+MU
+INTC
+QCOM
+TXN
+ADI
+LRCX
+AMAT
+KLAC
+ASML
+ARM
+MRVL
+ON
+NXPI
+SMCI
+# Semi ETFs — useful as the group's own confirmation line
+SMH
+SOXX
