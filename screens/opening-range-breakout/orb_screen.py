@@ -125,6 +125,7 @@ class Signal:
     last_price: float
     status: str  # "target" | "stopped" | "open" | "no_follow_through"
     resolved_ambiguously: bool  # resolving bar touched stop AND target
+    resolved_on: str  # "fine" | "signal" — bar size the replay walked
     bars_to_resolution: Optional[int]
     mfe_r: Optional[float]
     mae_r: Optional[float]
@@ -214,13 +215,25 @@ def _evaluate_outcome(
 
 
 def _build_signal(
-    frame: pd.DataFrame, today: pd.DataFrame, symbol: str, cfg: Config
+    frame: pd.DataFrame,
+    today: pd.DataFrame,
+    symbol: str,
+    cfg: Config,
+    fine: Optional[pd.DataFrame] = None,
 ) -> tuple[Optional[Signal], Optional[str]]:
     """Core screen for one session.
 
     `today` holds the session being screened; `frame` holds the same bars plus
     preceding history, so the volume benchmark and ATR can look back past the
     session boundary. Returns (signal, reject_reason) with exactly one set.
+
+    `fine`, when given, is a HIGHER-RESOLUTION frame of the same session used
+    only to replay the outcome. Detection stays on `today`'s bars; resolution
+    walks the finer ones. This matters because a bar straddling both stop and
+    target is charged as a loss, and a stop close to entry makes that common —
+    so a coarse replay penalises tight stops for a reason that has nothing to
+    do with the trade. Finer bars shrink the window in which the ordering is
+    unknowable.
     """
     if today.empty:
         return None, "no bars"
@@ -301,8 +314,20 @@ def _build_signal(
         rel = "<=" if long_side else ">="
         return None, f"non-positive risk (entry {entry:.2f} {rel} stop {stop:.2f})"
 
+    # Entry is the breakout bar's CLOSE, so the replay starts at the next
+    # signal bar's open — one signal-bar step after bo_ts, whether the replay
+    # runs on the signal bars or on finer ones.
+    if fine is not None and not fine.empty:
+        steps = pd.Series(today.index).diff().dropna()
+        step = steps.median() if not steps.empty else pd.Timedelta(0)
+        forward = fine[fine.index >= bo_ts + step]
+        resolution = "fine"
+    else:
+        forward = today[today.index > bo_ts]
+        resolution = "signal"
+
     status, ambiguous, bars_to, mfe_r, mae_r = _evaluate_outcome(
-        today[today.index > bo_ts], entry, stop, target, risk, cfg.side
+        forward, entry, stop, target, risk, cfg.side
     )
 
     return (
@@ -330,6 +355,7 @@ def _build_signal(
             last_price=round(float(today["close"].iloc[-1]), 4),
             status=status,
             resolved_ambiguously=ambiguous,
+            resolved_on=resolution,
             bars_to_resolution=bars_to,
             mfe_r=round(mfe_r, 2) if mfe_r is not None else None,
             mae_r=round(mae_r, 2) if mae_r is not None else None,
@@ -339,9 +365,17 @@ def _build_signal(
 
 
 def screen_symbol(
-    df: pd.DataFrame, symbol: str, cfg: Config, session: Optional[str] = None
+    df: pd.DataFrame,
+    symbol: str,
+    cfg: Config,
+    session: Optional[str] = None,
+    fine: Optional[pd.DataFrame] = None,
 ) -> tuple[Optional[Signal], Optional[str]]:
-    """Screen the latest session, or a specific one via session='YYYY-MM-DD'."""
+    """Screen the latest session, or a specific one via session='YYYY-MM-DD'.
+
+    `fine` is an optional higher-resolution frame of the same symbol, used
+    only to replay outcomes (see `_build_signal`).
+    """
     rth = regular_session(df, cfg)
     if rth.empty:
         return None, "no regular-hours bars"
@@ -359,7 +393,12 @@ def screen_symbol(
     history = cfg.vol_lookback + cfg.atr_length
     frame = scoped.iloc[max(0, start - history) :]
 
-    return _build_signal(frame, today, symbol, cfg)
+    fine_today = None
+    if fine is not None:
+        fine_rth = regular_session(fine, cfg)
+        fine_today = fine_rth[fine_rth.index.date == target_date]
+
+    return _build_signal(frame, today, symbol, cfg, fine_today)
 
 
 def load_csv(path: str, input_tz: str) -> dict[str, pd.DataFrame]:
@@ -414,6 +453,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--buffer-atr-mult", type=float, default=0.10)
     p.add_argument("--min-buffer-pct", type=float, default=0.0005)
     p.add_argument("--confirm-on", choices=("close", "high"), default="close")
+    p.add_argument("--no-fine-resolution", action="store_true",
+                   help="replay outcomes on the signal bars instead of the "
+                        "input bars (restores the coarse, tight-stop-biased "
+                        "measurement)")
     p.add_argument("--show-rejects", action="store_true", help="list why each symbol failed")
     p.add_argument("--csv-out", default=None, help="write signals to this path")
     args = p.parse_args(argv)
@@ -424,7 +467,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     if "" in frames:
         frames = {args.ticker or "SYMBOL": frames.pop("")}
 
+    # Keep the input bars for outcome replay; signals detect on the resampled
+    # ones. Without this the tie rule systematically penalises tight stops.
+    fine_frames: dict[str, pd.DataFrame] = {}
     if args.timeframe:
+        if not args.no_fine_resolution:
+            fine_frames = dict(frames)
         frames = {s: resample(df, args.timeframe) for s, df in frames.items()}
 
     signals: list[Signal] = []
@@ -444,7 +492,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         for symbol in sorted(frames):
             try:
-                sig, reason = screen_symbol(frames[symbol], symbol, cfg, args.session)
+                sig, reason = screen_symbol(
+                    frames[symbol], symbol, cfg, args.session,
+                    fine=fine_frames.get(symbol),
+                )
             except Exception as exc:  # one bad symbol should not kill the scan
                 rejects.append((f"{symbol}/{side}", f"error: {exc}"))
                 continue
@@ -458,7 +509,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         cols = [
             "symbol", "side", "session", "breakout_time", "orh", "orl", "entry",
             "stop", "target", "risk", "risk_pct", "rr", "vol_ratio", "status",
-            "mfe_r", "mae_r", "is_latest_bar", "last_price",
+            "resolved_on", "resolved_ambiguously", "mfe_r", "mae_r",
+            "is_latest_bar", "last_price",
         ]
         print(table[cols].to_string(index=False))
         if args.csv_out:

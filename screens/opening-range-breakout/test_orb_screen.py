@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
-from orb_screen import ET, Config, screen_symbol
+from orb_screen import ET, Config, resample, screen_symbol
 
 # Zero buffer -> stop sits exactly on the broken level, so the arithmetic is
 # checkable to the cent.
@@ -428,6 +428,107 @@ def test_invalid_side_rejected() -> None:
         check("invalid side raises", False, "no exception")
     except ValueError:
         check("invalid side raises", True)
+
+
+# ------------------------------------------------- fine-resolution replay
+
+def _straddle_fixture() -> tuple:
+    """1-minute bars whose 5-minute aggregate hides the true ordering.
+
+    Opening range 09:30-09:59 tops at 100.00. The 10:00-10:04 five-minute
+    bucket closes at 101.00 on double volume, so with a zero buffer:
+    entry 101.00, stop 100.00, risk 1.00, target 103.00.
+
+    The 10:05-10:09 bucket then spans high 103.50 and low 99.00 — it touches
+    BOTH levels, so a five-minute replay must call it a stop. The underlying
+    minutes show price reaching 103.50 at 10:05 and only breaking 100.00 at
+    10:08, so the trade actually won.
+    """
+    specs = [(99.5, 100.0, 99.0, 99.5, 200.0)] * 30            # 09:30-09:59
+    specs += [(100.2, 100.6, 100.1, 100.4, 400.0)] * 4         # 10:00-10:03
+    specs += [(100.4, 101.2, 100.3, 101.0, 400.0)]             # 10:04 close
+    specs += [
+        (101.0, 103.5, 101.0, 103.2, 300.0),                   # 10:05 target
+        (103.2, 103.3, 102.0, 102.1, 300.0),
+        (102.1, 102.2, 101.0, 101.1, 300.0),
+        (101.1, 101.2, 99.0, 99.2, 300.0),                     # 10:08 stop
+        (99.2, 99.6, 99.1, 99.5, 300.0),
+    ]
+    fine = session_bars(specs, minutes=1)
+    return fine, resample(fine, "5min")
+
+
+def test_coarse_replay_misreads_a_straddling_bar() -> None:
+    fine, coarse = _straddle_fixture()
+    sig, reason = screen_symbol(coarse, "TEST", EXACT)
+    check("signal found on 5-minute bars", sig is not None, str(reason))
+    if sig is None:
+        return
+    check("entry is the 5-minute breakout close", sig.entry == 101.0,
+          f"got {sig.entry}")
+    check("target is 103.00", sig.target == 103.0, f"got {sig.target}")
+    check("coarse replay calls the straddling bar a stop",
+          sig.status == "stopped", f"got {sig.status}")
+    check("and flags it as ambiguous", sig.resolved_ambiguously is True)
+    check("resolved_on records the coarse replay", sig.resolved_on == "signal",
+          sig.resolved_on)
+
+
+def test_fine_replay_recovers_the_true_ordering() -> None:
+    """Same signal, same levels, replayed on 1-minute bars."""
+    fine, coarse = _straddle_fixture()
+    sig, reason = screen_symbol(coarse, "TEST", EXACT, fine=fine)
+    check("signal still found", sig is not None, str(reason))
+    if sig is None:
+        return
+    check("levels are unchanged by the finer replay",
+          sig.entry == 101.0 and sig.stop == 100.0 and sig.target == 103.0,
+          f"{sig.entry}/{sig.stop}/{sig.target}")
+    check("fine replay sees the target hit first", sig.status == "target",
+          f"got {sig.status}")
+    check("no ambiguity remains", sig.resolved_ambiguously is False)
+    check("resolved_on records the fine replay", sig.resolved_on == "fine",
+          sig.resolved_on)
+
+
+def test_fine_replay_starts_after_the_breakout_bar() -> None:
+    """Entry is the breakout bar's close, so its own minutes must be excluded.
+
+    The 10:00-10:04 bucket dips to 100.10 intrabar, below a 100.00 stop only
+    if the replay wrongly reaches back inside the entry bar. It must not.
+    """
+    fine, coarse = _straddle_fixture()
+    sig, _ = screen_symbol(coarse, "TEST", EXACT, fine=fine)
+    check("replay does not resolve inside the entry bar",
+          sig is not None and sig.bars_to_resolution == 1,
+          f"got {sig.bars_to_resolution if sig else None}")
+
+
+def test_fine_replay_short_side() -> None:
+    """Mirror: a straddling bar that actually hit the short target first."""
+    specs = [(100.5, 101.0, 100.0, 100.5, 200.0)] * 30         # ORL = 100.00
+    specs += [(99.8, 99.9, 99.4, 99.6, 400.0)] * 4
+    specs += [(99.6, 99.7, 98.8, 99.0, 400.0)]                 # entry 99.00
+    specs += [
+        (99.0, 99.1, 96.5, 96.8, 300.0),                       # target 97.00 hit
+        (96.8, 98.0, 96.7, 97.9, 300.0),
+        (97.9, 100.4, 97.8, 100.3, 300.0),                     # stop 100.00 hit
+    ]
+    fine = session_bars(specs, minutes=1)
+    coarse = resample(fine, "5min")
+
+    coarse_sig, _ = screen_symbol(coarse, "TEST", SHORT)
+    fine_sig, reason = screen_symbol(coarse, "TEST", SHORT, fine=fine)
+
+    check("short signal found", fine_sig is not None, str(reason))
+    if fine_sig is None or coarse_sig is None:
+        return
+    check("short target is 2R below entry", fine_sig.target == 97.0,
+          f"got {fine_sig.target}")
+    check("coarse replay misreads the short as stopped",
+          coarse_sig.status == "stopped", f"got {coarse_sig.status}")
+    check("fine replay recovers the short win", fine_sig.status == "target",
+          f"got {fine_sig.status}")
 
 
 def main() -> int:

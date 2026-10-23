@@ -185,12 +185,34 @@ rule charges every one of those as a full loss. The ambiguity rate and the
 expectancy move together monotonically as `rr` widens the target away, which
 is the fingerprint of the convention driving the result.
 
-So under a bar-level replay, **a tight-stop mode cannot be compared fairly
-against a wide-stop one.** Separating them needs tick data, or at minimum a
-much finer bar than the stop distance. Until then, treat `stop_mode` as a
-choice to make on trading grounds and read `pct_ambig` as the confound
-warning it is: anything much above a few percent means that cell's expectancy
-is partly an artifact.
+#### The mitigation: detect on coarse bars, resolve on fine ones
+
+Signals are detected on the `--timeframe` bars but outcomes are replayed on
+the **input** bars, which shrinks the window where the ordering is unknowable.
+With 1-minute input resampled to 5-minute signals, on the same fixture:
+
+| side | stop_mode | rr | `pct_ambig` coarse → fine | expectancy coarse → fine |
+|---|---|---|---|---|
+| short | `range_edge` | 1.5 | 0.220 → **0.044** | −0.337 → **−0.174** |
+| long | `range_edge` | 1.5 | 0.241 → **0.103** | −0.335 → **−0.278** |
+| short | `range_edge` | 2.0 | 0.165 → 0.022 | −0.272 → −0.207 |
+| long | `range_edge` | 2.0 | 0.149 → 0.080 | −0.239 → −0.205 |
+| long | `bar_extreme` | 1.5 | 0.012 → 0.000 | 0.084 → **0.084** |
+| short | `bar_extreme` | 1.5 | 0.000 → 0.000 | 0.101 → **0.101** |
+
+Every `bar_extreme` expectancy is unchanged to three decimals while every
+`range_edge` figure improves. That is the useful part: the correction moves
+exactly the cells the confound was distorting and leaves the others alone,
+which is far better evidence that it addresses the bias than the size of the
+improvement is.
+
+`--no-fine-resolution` restores the coarse replay if you want to see the
+difference yourself. `resolved_on` on each signal records which was used.
+
+Residual ambiguity still reaches 10% on the tightest `range_edge` cells, so
+**a tight-stop mode still cannot be compared cleanly against a wide-stop
+one** — that needs tick data. Treat `stop_mode` as a trading decision and
+read `pct_ambig` as the confound warning it is.
 
 Within a single `stop_mode` the comparison across `vol_multiple` is sound,
 because the stop distance is held constant.

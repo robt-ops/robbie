@@ -30,7 +30,7 @@ def sig(status: str, entry: float = 100.0, risk: float = 1.0,
         risk_pct=risk / entry * 100, reward=2 * risk, rr=2.0,
         vol=0.0, vol_benchmark=1.0, vol_ratio=2.0, vol_window_bars=20,
         vol_window_crossed_session=False, atr=1.0, is_latest_bar=False,
-        last_price=last, status=status, resolved_ambiguously=False,
+        last_price=last, status=status, resolved_ambiguously=False, resolved_on="fine",
         bars_to_resolution=1,
         mfe_r=mfe, mae_r=mae,
     )

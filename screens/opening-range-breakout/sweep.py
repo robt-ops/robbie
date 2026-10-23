@@ -55,14 +55,19 @@ def sessions_in(df: pd.DataFrame, cfg: Config) -> list[str]:
 
 
 def collect_signals(
-    frames: dict[str, pd.DataFrame], cfg: Config
+    frames: dict[str, pd.DataFrame],
+    cfg: Config,
+    fine_frames: Optional[dict[str, pd.DataFrame]] = None,
 ) -> list[Signal]:
     """Screen every symbol across every session it has."""
     out: list[Signal] = []
+    fine_frames = fine_frames or {}
     for symbol, df in frames.items():
         for session in sessions_in(df, cfg):
             try:
-                sig, _ = screen_symbol(df, symbol, cfg, session)
+                sig, _ = screen_symbol(
+                    df, symbol, cfg, session, fine=fine_frames.get(symbol)
+                )
             except Exception:
                 continue
             if sig is not None:
@@ -143,6 +148,7 @@ def sweep(
     stop_modes: list[str],
     base: Config,
     sides: tuple[str, ...] = ("long",),
+    fine_frames: Optional[dict[str, pd.DataFrame]] = None,
 ) -> tuple[pd.DataFrame, dict[tuple, list[Signal]]]:
     """Grid over the thresholds, plus a volume-filter-off baseline per cell."""
     rows: list[dict] = []
@@ -157,7 +163,7 @@ def sweep(
         cfg = replace(
             base, side=side, stop_mode=stop_mode, rr_multiple=rr, vol_multiple=vm
         )
-        signals = collect_signals(frames, cfg)
+        signals = collect_signals(frames, cfg, fine_frames)
         collected[(side, stop_mode, rr, vm)] = signals
         rows.append(
             {
@@ -233,6 +239,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--vol-multiples", default="1.25,1.5,2.0,2.5")
     p.add_argument("--rr-multiples", default="1.5,2.0,3.0")
     p.add_argument("--sides", default="long", help="long, short, or long,short")
+    p.add_argument("--no-fine-resolution", action="store_true",
+                   help="replay outcomes on signal bars, not input bars")
     p.add_argument("--stop-modes", default="range_edge,bar_extreme")
     p.add_argument("--opening-minutes", type=int, default=30)
     p.add_argument("--vol-lookback", type=int, default=20)
@@ -255,7 +263,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     if "" in frames:
         frames = {args.ticker or "SYMBOL": frames.pop("")}
 
+    fine_frames: dict[str, pd.DataFrame] = {}
     if args.timeframe:
+        if not args.no_fine_resolution:
+            fine_frames = dict(frames)
         frames = {s: resample(df, args.timeframe) for s, df in frames.items()}
 
     all_sessions = sorted({d for df in frames.values() for d in sessions_in(df, base)})
@@ -272,6 +283,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         args.stop_modes.split(","),
         base,
         tuple(x.strip() for x in args.sides.split(",") if x.strip()),
+        fine_frames,
     )
 
     # Only adequately-powered cells are eligible to be ranked. A cell with
