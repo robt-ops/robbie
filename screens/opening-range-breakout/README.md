@@ -9,7 +9,9 @@ the broken level and a target at a fixed risk multiple.
 | File | Purpose |
 |---|---|
 | `orb_screen.py` | the screen; importable, and a CLI |
+| `sweep.py` | runs the screen over every session for a grid of thresholds |
 | `test_orb_screen.py` | 17 tests / 41 checks on synthetic fixtures, no network |
+| `test_sweep.py` | 15 tests / 37 checks on hand-built signal sets |
 
 ## Run
 
@@ -109,6 +111,63 @@ scan.
 informative than the hits — a list of near-misses at 1.3–1.4x volume tells you
 the threshold is doing the work, while rejects reading "no close above ORH"
 across the board means the day had no breakouts at all.
+
+## Finding out whether the thresholds are any good
+
+`sweep.py` runs the screen over every session in a file for a grid of
+thresholds and reports what each combination would have produced.
+
+```bash
+python3 sweep.py --csv ~/Documents/lse-market-data/lse_1m_bars.csv --timeframe 5min
+
+python3 sweep.py --csv bars.csv --timeframe 5min \
+    --vol-multiples 1.0,1.25,1.5,2.0 --rr-multiples 1.5,2.0,3.0 \
+    --signals-out top_cell_signals.csv
+```
+
+It is built to resist the thing it is used for. A grid search returns the best
+cell it finds, and the best cell in any grid is optimistically biased — scan 30
+combinations of noise and the top one looks good by construction. Three
+features push back:
+
+**A baseline row per cell.** `vol_multiple = 0` passes every breakout, so each
+group carries a no-filter control. If 1.5x does not beat its own baseline, the
+volume condition is only costing setups. The comparison is made **per
+`(stop_mode, rr)` group**, like for like — comparing a 1.5R filtered result
+against a 3R baseline is not the same experiment.
+
+**Under-powered cells are shown but not ranked.** `--min-n` (default 30) keeps
+thin cells out of the ranking. This matters more than it sounds: on the test
+fixture a 13-trade cell outscored an 88-trade baseline, which is exactly the
+noise the guard exists to stop. Lower it with `--min-n` if you want to look
+anyway, and the output will state the small `n` it is relying on.
+
+**Two expectancies, side by side.** Unresolved trades have to go somewhere and
+neither choice is neutral. `expectancy_r` uses resolved trades only, which
+flatters the result when trades that never reached a level were drifting
+against the position. `expectancy_mtm_r` marks unresolved to the session's
+last close, which includes everything but treats an arbitrary cutoff as an
+exit. A wide gap between them means the sample leans on unresolved trades and
+neither number is trustworthy.
+
+Expectancy assumes exits exactly at the stop or target: no slippage, no
+commission, one unit of risk per trade. Real fills are worse, and the gap is
+widest on the fastest moves — which is where breakout trades live.
+
+Nothing the sweep prints is out-of-sample.
+
+### What the synthetic fixture showed, and why it proves nothing about edge
+
+Run against a 30-session random-walk fixture (4 symbols, 46,800 one-minute
+bars), the volume filter cut 88 baseline breakouts to 13 at 1.25x and 7 at
+1.5x, and beat its baseline in only 2 of 6 like-for-like comparisons.
+
+That is not evidence against the filter. The fixture generates price and
+volume **independently**, so a breakout there carries no reason to arrive on
+heavy volume — the filter is sampling at random by construction. Real
+breakouts do tend to come with volume, which is the entire premise. The
+fixture tests that the plumbing is right; only your own bars can say whether
+1.5x earns its place.
 
 ## Limitations
 
