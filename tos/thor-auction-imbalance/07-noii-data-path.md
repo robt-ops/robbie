@@ -87,14 +87,40 @@ Twelve directional samples split 6 buy / 6 sell, separated by the sign of
 `near - ref` with no contradictions. Full table in
 `noii-capture-2026-10-23-open.md`.
 
-## Still unresolved
+## `imbalance_var_indicator` decoded
 
-`imbalance_var_indicator` read `10` on every covered symbol and `0` on the
-two uncovered ones, so it distinguishes "has data" from "has none" but its
-enum is otherwise unconfirmed. Nasdaq's variance indicator encodes how far
-the near price sits from the current reference, which would make it useful
-for sizing conviction — worth decoding, but it carries no information in
-this sample because it never varied.
+Resolved from the closing-cross capture, where it finally varied:
+
+```
+var_indicator = 10                                 when |near - ref| / ref < 1%
+              = floor(|near - ref| / ref * 100)    otherwise
+              = 0                                  indicative price not published
+```
+
+Matched on all 20 symbols, including the two that bracket the 1% threshold
+(NXPI 0.92% reads `10`, SMCI 1.12% reads `1`). This is Nasdaq's variance
+indicator, where `L` means under 1% and `1`-`9` are whole-percent bands;
+Webull encodes `L` as `10`. Details in
+`noii-capture-2026-10-23-close.md`.
+
+An earlier note here read `var_indicator` as a has-data/no-data flag. That
+was an artifact of sampling only the opening cross, where every covered
+symbol sat under 1% and so read `10`.
+
+## Both cross windows publish in two phases
+
+The `0` value above is not an error state — it is the early phase of each
+window, where share counts are disseminated but indicative prices are not:
+
+| Window | Early phase | Late phase |
+|---|---|---|
+| Opening | 09:25-09:28, 10-second ticks, near/far `0.0` | from 09:28, 1-second ticks, prices published |
+| Closing | ~15:50-15:55, 10-second ticks, near/far `0.0` | from ~15:55, 1-second ticks, prices published |
+
+Direction is readable in the early phase (`imbalance_side` is populated), but
+it is unstable: nine of twenty symbols changed side between 15:52 and 15:57,
+including every one of the largest imbalances. Treat the early phase as a
+provisional state and not a signal.
 
 ## What this does and does not change
 
