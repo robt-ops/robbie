@@ -43,8 +43,8 @@ From `get_stock_noii_snapshot`:
 1. **`category: "US_ETF"` is rejected** by the interface — it returns
    `UNSUPPORTED_CATEGORY` even though the schema advertises it. Pass
    `category: "US_STOCK"` for ETFs instead: `QQQ` returns a full record that
-   way. So the ETFs in `universe.txt` are covered, but only via the
-   counter-intuitive argument.
+   way. Which ETFs return anything is a separate question, settled by
+   listing venue in limit 3 below.
 
 2. **`get_stock_noii_bars` drops the share counts.** The time series carries
    only the three prices — no `paired_shares`, no `imbalance_shares`, no
@@ -52,29 +52,49 @@ From `get_stock_noii_snapshot`:
    snapshot, one point at a time. Building an imbalance *history* therefore
    means polling the snapshot during 09:28–09:30, not fetching bars.
 
-3. **NYSE-listed names are effectively uncovered.** `TSM` returned
-   `paired_shares: 111` against `NVDA`'s `915,213`. This is Nasdaq's own
-   cross only, not the NYSE primary auction, so for a NYSE listing it measures
-   a venue that barely participates. Of the universe this affects `TSM`, and
-   `SPY`/`IWM` (NYSE Arca) should be treated as suspect until their paired
-   counts are checked against a Nasdaq-listed name on the same morning.
+3. **Coverage follows listing venue — Nasdaq listings only.** Confirmed
+   against the full universe during the 2026-10-23 opening cross (see
+   `noii-capture-2026-10-23-open.md`): all 20 Nasdaq-listed names returned
+   live records, including the ETFs `QQQ`, `SMH` and `SOXX`, which work
+   because they are Nasdaq listings and not because ETFs generally do.
+   `TSM` (NYSE) and `IWM` (Arca) returned `side 4` with every field zeroed.
+
+   `SPY` (Arca) is the trap: it returns a *populated* ref price with
+   `side 1`, which reads as a legitimate "no imbalance". It is actually 2
+   paired shares of noise, while SPY's real opening auction runs on Arca
+   where this feed cannot see it. Exclude `SPY`, `IWM` and `TSM` from any
+   imbalance ranking — SPY especially, because it fails in a way that looks
+   like success.
 
 Outside the cross windows the snapshot returns the **previous session's final**
 record — NVDA at 09:13 ET today still carried yesterday's 09:29:59 stamp. Always
 check `imbalance_time` before treating a snapshot as live.
 
-## Unresolved
+## `imbalance_side` decoded
 
-`imbalance_side` is an integer, and the mapping to Nasdaq's `B`/`S`/`N`/`O`
-codes is undocumented here. Observed so far: `1` whenever
-`imbalance_shares` is `0`; `3` on QQQ (28,039 unpaired) and SMCI (18,626
-unpaired), in both cases with `near_price` just *below* `ref_price`, which
-hints at `3` = sell-side. Two samples pointing the same way is not a decode.
-Resolve it by sampling the universe live during a cross and correlating the
-code against the sign of `near_price - ref_price`.
+Resolved by sampling all 23 universe symbols live during the 2026-10-23
+opening cross and correlating the code against the sign of
+`near_price - ref_price`:
 
-`imbalance_var_indicator` read `10` on every symbol sampled; its enum is
-likewise unconfirmed.
+| Code | Meaning |
+|---|---|
+| `1` | no imbalance |
+| `2` | **buy** imbalance |
+| `3` | **sell** imbalance |
+| `4` | no data for this symbol |
+
+Twelve directional samples split 6 buy / 6 sell, separated by the sign of
+`near - ref` with no contradictions. Full table in
+`noii-capture-2026-10-23-open.md`.
+
+## Still unresolved
+
+`imbalance_var_indicator` read `10` on every covered symbol and `0` on the
+two uncovered ones, so it distinguishes "has data" from "has none" but its
+enum is otherwise unconfirmed. Nasdaq's variance indicator encodes how far
+the near price sits from the current reference, which would make it useful
+for sizing conviction — worth decoding, but it carries no information in
+this sample because it never varied.
 
 ## What this does and does not change
 
