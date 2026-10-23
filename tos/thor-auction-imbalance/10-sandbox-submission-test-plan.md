@@ -2,6 +2,11 @@
 
 For the Mac-side session to run. This cannot be run from a cloud session.
 
+Note: Webull is the paper-trading venue (see `09-webull-execution-surface.md`),
+so this plan runs against paper money throughout. The account-targeting
+precondition below is about keeping sandbox results attributable to one
+account, not about avoiding real-money risk.
+
 ## Why this exists
 
 Every runner verification so far (27 tests, then 36, plus three authenticated

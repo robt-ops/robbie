@@ -1,10 +1,11 @@
-# Webull execution surface — live trading is reachable from any Claude session
+# Broker connector execution surface
 
-Verified 2026-10-23 via `get_account_authorization` on the Webull connector.
+Verified 2026-10-23 via `get_account_authorization` on the Webull connector,
+with the venue roles confirmed by the account owner.
 
 ## Finding
 
-Four accounts are authorized to this AI client. **Three can place real orders.**
+Four accounts are authorized to this AI client. **Three can place orders.**
 
 | Account | Authorization |
 |---|---|
@@ -21,7 +22,22 @@ Webull's own description of the categories:
 > **Trading** — Includes all Non-Trading capabilities, plus the ability to
 > place, modify, and cancel orders.
 
-These are live brokerage accounts, not sandbox accounts.
+**`get_account_authorization` does not distinguish paper from live.** It
+reports only the Trading / Non-Trading category, so a `Trading` row says an
+order can be placed — not that real money is behind it. Do not infer venue
+type from this endpoint.
+
+Per the account owner, the venue roles are:
+
+| Connector | Role |
+|---|---|
+| Webull | **paper trading** — the THOR sandbox runner's venue |
+| RobinhoodAgentic | intended venue for automated trading, once built |
+| Interactive_Brokers | in use, intentional |
+
+So the order-placing authorization on all three is deliberate, not a
+misconfiguration. The connector permissions below are recorded as *where* the
+controls live, not as a change to make.
 
 ## Why the runner's guards do not cover this
 
@@ -41,9 +57,10 @@ Its prompt instructs "NEVER place, modify or cancel orders, alerts or
 watchlists", which is the right instruction — but an instruction to a model is
 not a block.
 
-## Making it structural
+## Where the controls live
 
-Two independent fixes; doing both is better than either.
+Recorded for reference. Not a change to make — the current setup is
+intentional. This is where to reach for if a specific path ever needs closing.
 
 1. **Connector tool permissions** — at https://claude.ai/customize/connectors,
    open the Webull connector and set the order-placing tools to not-allowed:
@@ -58,12 +75,19 @@ Two independent fixes; doing both is better than either.
    Non-Trading for AI clients, keeping a separate account for anything that
    genuinely needs order entry.
 
-## Consequence for the runner
+## Where the startup assertion actually matters
 
-Because live Trading-authorized accounts sit behind the same credentials, a
-configuration typo in the runner is a high-consequence failure, not a
-nuisance. The runner should **assert at every startup that its target account
-is the intended sandbox account and refuse to start otherwise** — enumerate
-the accounts, compare against an explicit allowlist of one, and exit non-zero
-on mismatch. A config value that is merely *set* correctly is weaker than one
-that is *checked* on every run.
+Webull being the paper venue means a wrong-account typo in the THOR runner is
+a bookkeeping problem, not a money problem. The startup assertion is still
+worth having there — it keeps sandbox results attributable to one account —
+but it is not urgent.
+
+It becomes load-bearing on **RobinhoodAgentic**, which is the intended
+automated-trading venue. Whatever runs there should **assert at every startup
+that its target account matches an explicit allowlist and exit non-zero
+otherwise**, rather than trusting a config value to be right. Robinhood's
+surface is also wider than Webull's in one respect worth knowing before
+building against it: alongside `place_equity_order`, `place_option_order` and
+`place_crypto_order` it exposes `exercise_option` and `cancel_option_exercise`,
+so an automated path there can take assignment actions, not only open and
+close positions.
