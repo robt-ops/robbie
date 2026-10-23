@@ -46,14 +46,18 @@ and is the looser setting, not the better one.
 **2. Volume at least 1.5x the 20-period average.** The benchmark is the mean
 volume of the 20 bars *strictly before* the breakout bar.
 
+Short side (`--side short`) mirrors all three onto the opening-range LOW:
+breakdown below ORL, stop above the broken level, target below entry.
+
 **3. Stop just past the broken level, target at 2R.** Stop is the broken level
 minus a buffer; risk is `entry − stop`; target is `entry + 2 × risk`. Entry is
 the breakout bar's close.
 
 ```
 stop  = level − max(buffer_atr_mult × ATR(14), min_buffer_pct × entry)
-level = ORH                       # --stop-mode range_high (default)
-      | breakout bar's low        # --stop-mode bar_low
+level = the broken range edge     # --stop-mode range_edge (default)
+      | the breakout bar's extreme # --stop-mode bar_extreme
+#  (range_high / bar_low are accepted aliases from the long-only version)
 ```
 
 A pure percentage buffer is too tight on volatile names and too loose on calm
@@ -87,6 +91,10 @@ walk the bars after entry to say whether the target or stop came first. When a
 single bar touches both, the stop is assumed first — the worst-case intrabar
 convention also used in `strategies/thor-3bar-reversal/backtest.py`. No
 commissions, no slippage, no partial fills, no position sizing.
+
+That convention is not neutral between stop modes, which is why every signal
+carries `resolved_ambiguously` and the sweep reports `pct_ambig`. See
+"the tie rule punishes tight stops" below before comparing the two.
 
 ## Reading the output
 
@@ -122,7 +130,7 @@ python3 sweep.py --csv ~/Documents/lse-market-data/lse_1m_bars.csv --timeframe 5
 
 python3 sweep.py --csv bars.csv --timeframe 5min \
     --vol-multiples 1.0,1.25,1.5,2.0 --rr-multiples 1.5,2.0,3.0 \
-    --signals-out top_cell_signals.csv
+    --sides long,short --signals-out top_cell_signals.csv
 ```
 
 It is built to resist the thing it is used for. A grid search returns the best
@@ -156,6 +164,37 @@ widest on the fastest moves — which is where breakout trades live.
 
 Nothing the sweep prints is out-of-sample.
 
+### The tie rule punishes tight stops — do not read `stop_mode` off the table
+
+Found while sweeping both sides, and it is a flaw in the measurement rather
+than in the stops:
+
+| stop_mode | rr | `pct_ambig` | expectancy | median risk |
+|---|---|---|---|---|
+| `range_edge` | 1.5 | **0.241** | −0.339R | 0.238% |
+| `range_edge` | 2.0 | 0.149 | −0.241R | 0.238% |
+| `range_edge` | 3.0 | 0.092 | −0.172R | 0.238% |
+| `bar_extreme` | 1.5 | **0.012** | +0.088R | 0.607% |
+
+`range_edge` looked clearly worse than `bar_extreme` on both sides and at
+every reward multiple — a symmetry that reads like real structure. It is not.
+A `range_edge` stop sits a couple of cents from entry: here it was 2.5x
+tighter than `bar_extreme`. Both stop and target therefore sit close enough
+together that a single 5-minute bar straddles them, and the worst-case tie
+rule charges every one of those as a full loss. The ambiguity rate and the
+expectancy move together monotonically as `rr` widens the target away, which
+is the fingerprint of the convention driving the result.
+
+So under a bar-level replay, **a tight-stop mode cannot be compared fairly
+against a wide-stop one.** Separating them needs tick data, or at minimum a
+much finer bar than the stop distance. Until then, treat `stop_mode` as a
+choice to make on trading grounds and read `pct_ambig` as the confound
+warning it is: anything much above a few percent means that cell's expectancy
+is partly an artifact.
+
+Within a single `stop_mode` the comparison across `vol_multiple` is sound,
+because the stop distance is held constant.
+
 ### What the synthetic fixture showed, and why it proves nothing about edge
 
 Run against a 30-session random-walk fixture (4 symbols, 46,800 one-minute
@@ -171,8 +210,9 @@ fixture tests that the plumbing is right; only your own bars can say whether
 
 ## Limitations
 
-- **Long side only.** A short mirror keys off the opening-range low; not
-  implemented.
+- **Short side exists but is equally untested.** `--side short` mirrors the
+  logic onto the opening-range low; `--side both` scans each direction, so a
+  symbol can appear twice on a session that broke both ways.
 - **No ranking.** The screen finds structure. It does not score quality and
   makes no claim a listed setup is worth taking.
 - **Thresholds are untested priors.** 1.5x, 2R, the 0.10 ATR buffer — none are

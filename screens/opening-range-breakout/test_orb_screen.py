@@ -283,6 +283,153 @@ def test_naive_timestamps_localised() -> None:
     check("tz-naive input is treated as ET", sig is not None, str(reason))
 
 
+# ---------------------------------------------------------------- short side
+
+SHORT = Config(buffer_atr_mult=0.0, min_buffer_pct=0.0, side="short")
+
+
+def flat_opening_short(low: float = 100.0, vol: float = 1000.0) -> list[tuple]:
+    """Six bars whose lowest low is `low` — the mirror of flat_opening()."""
+    return [(101.0, 101.5, low + 0.5, 101.0, vol)] * 5 + [
+        (101.0, 101.5, low, 101.0, vol)
+    ]
+
+
+def test_short_breakdown_arithmetic() -> None:
+    """Exact mirror of test_clean_breakout_arithmetic."""
+    df = session_bars(flat_opening_short() + [(99.8, 100.2, 98.5, 99.0, 2000.0)])
+    sig, reason = screen_symbol(df, "TEST", SHORT)
+
+    check("short breakdown produces a signal", sig is not None, str(reason))
+    if sig is None:
+        return
+    check("side is recorded as short", sig.side == "short", sig.side)
+    check("ORL is the opening-range low", sig.orl == 100.0, f"got {sig.orl}")
+    check("entry is the breakdown close", sig.entry == 99.0, f"got {sig.entry}")
+    check("stop sits ABOVE the broken level", sig.stop == 100.0, f"got {sig.stop}")
+    check("risk = stop - entry (positive)", sig.risk == 1.0, f"got {sig.risk}")
+    check("target is BELOW entry by 2R", sig.target == 97.0, f"got {sig.target}")
+    check("reward reported positive", sig.reward == 2.0, f"got {sig.reward}")
+    check("risk_pct is positive", sig.risk_pct > 0, f"got {sig.risk_pct}")
+
+
+def test_short_ignores_upside_breakout() -> None:
+    """A session that breaks UP must yield no short signal."""
+    df = session_bars(flat_opening() + [(100.2, 101.5, 99.8, 101.0, 2000.0)])
+    sig, reason = screen_symbol(df, "TEST", SHORT)
+    check("upside breakout gives no short", sig is None)
+    check("rejection names the ORL, not the ORH",
+          reason is not None and "ORL" in reason, str(reason))
+
+
+def test_long_ignores_downside_breakdown() -> None:
+    df = session_bars(flat_opening_short() + [(99.8, 100.2, 98.5, 99.0, 2000.0)])
+    sig, _ = screen_symbol(df, "TEST", EXACT)
+    check("downside breakdown gives no long", sig is None)
+
+
+def test_short_outcome_target_hit() -> None:
+    """Price falling to the target is a WIN for a short."""
+    df = session_bars(
+        flat_opening_short()
+        + [(99.8, 100.2, 98.5, 99.0, 2000.0), (99.0, 99.1, 96.8, 96.9, 900.0)]
+    )
+    sig, _ = screen_symbol(df, "TEST", SHORT)
+    check("falling to target is a short win",
+          sig is not None and sig.status == "target",
+          f"got {sig.status if sig else None}")
+
+
+def test_short_outcome_stopped() -> None:
+    """Price rising through the stop is a LOSS for a short."""
+    df = session_bars(
+        flat_opening_short()
+        + [(99.8, 100.2, 98.5, 99.0, 2000.0), (99.1, 100.6, 99.0, 100.4, 900.0)]
+    )
+    sig, _ = screen_symbol(df, "TEST", SHORT)
+    check("rising through stop is a short loss",
+          sig is not None and sig.status == "stopped",
+          f"got {sig.status if sig else None}")
+
+
+def test_short_excursions_are_direction_correct() -> None:
+    """A favourable move DOWN must register as MFE, not MAE.
+
+    This is the test that catches an inverted sign, which would otherwise
+    report short losses as wins.
+    """
+    df = session_bars(
+        flat_opening_short()
+        + [(99.8, 100.2, 98.5, 99.0, 2000.0), (99.0, 99.2, 98.0, 98.2, 900.0)]
+    )
+    sig, _ = screen_symbol(df, "TEST", SHORT)
+    check("1.0 down on 1.0 risk -> MFE 1.0R",
+          sig is not None and sig.mfe_r == 1.0, f"got {sig.mfe_r if sig else None}")
+    check("0.2 up on 1.0 risk -> MAE 0.2R",
+          sig is not None and abs(sig.mae_r - 0.2) < 1e-9,
+          f"got {sig.mae_r if sig else None}")
+
+
+def test_short_ambiguous_bar_counts_as_stop() -> None:
+    df = session_bars(
+        flat_opening_short()
+        + [(99.8, 100.2, 98.5, 99.0, 2000.0), (99.0, 101.0, 96.0, 97.0, 900.0)]
+    )
+    sig, _ = screen_symbol(df, "TEST", SHORT)
+    check("short bar hitting both levels counts as stopped",
+          sig is not None and sig.status == "stopped",
+          f"got {sig.status if sig else None}")
+
+
+def test_short_bar_extreme_stop_uses_bar_high() -> None:
+    df = session_bars(flat_opening_short() + [(99.8, 100.2, 98.5, 99.0, 2000.0)])
+    cfg = Config(buffer_atr_mult=0.0, min_buffer_pct=0.0, side="short",
+                 stop_mode="bar_extreme")
+    sig, _ = screen_symbol(df, "TEST", cfg)
+    check("bar_extreme stops at the breakdown bar's HIGH",
+          sig is not None and sig.stop == 100.2, f"got {sig.stop if sig else None}")
+    check("wider stop -> risk 1.2",
+          sig is not None and abs(sig.risk - 1.2) < 1e-9,
+          f"got {sig.risk if sig else None}")
+    check("target 2R below entry",
+          sig is not None and abs(sig.target - (99.0 - 2.4)) < 1e-9,
+          f"got {sig.target if sig else None}")
+
+
+def test_short_buffer_raises_stop() -> None:
+    df = session_bars(flat_opening_short() + [(99.8, 100.2, 98.5, 99.0, 2000.0)])
+    cfg = Config(buffer_atr_mult=0.0, min_buffer_pct=0.01, side="short")
+    sig, _ = screen_symbol(df, "TEST", cfg)
+    check("1% buffer lifts the short stop above the level",
+          sig is not None and abs(sig.stop - (100.0 + 0.99)) < 1e-9,
+          f"got {sig.stop if sig else None}")
+
+
+def test_short_volume_filter_applies() -> None:
+    df = session_bars(flat_opening_short() + [(99.8, 100.2, 98.5, 99.0, 1200.0)])
+    sig, reason = screen_symbol(df, "TEST", SHORT)
+    check("thin-volume breakdown is rejected", sig is None)
+    check("rejection names the shortfall",
+          reason is not None and "volume 1.20x" in reason, str(reason))
+
+
+def test_stop_mode_aliases_resolve() -> None:
+    check("range_high aliases to range_edge",
+          Config(stop_mode="range_high").stop_mode == "range_edge")
+    check("bar_low aliases to bar_extreme",
+          Config(stop_mode="bar_low").stop_mode == "bar_extreme")
+    check("confirm_on high aliases to extreme",
+          Config(confirm_on="high").confirm_on == "extreme")
+
+
+def test_invalid_side_rejected() -> None:
+    try:
+        Config(side="sideways")
+        check("invalid side raises", False, "no exception")
+    except ValueError:
+        check("invalid side raises", True)
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

@@ -51,8 +51,10 @@ Notes / known limitations:
       assumed first, matching the worst-case intrabar convention used in
       strategies/thor-3bar-reversal/backtest.py. No commissions, no slippage,
       no partial fills.
-    - Long-side only. A short mirror would key off the opening-range LOW and
-      is not implemented here.
+    - Both sides are supported. `--side short` mirrors the logic onto the
+      opening-range LOW: breakdown below ORL, stop above the broken level,
+      target below entry. `--side both` scans each symbol twice, so a symbol
+      can appear once per direction on a session that broke both ways.
     - This screen identifies structure. It does not rank by quality and makes
       no claim that a listed setup is worth taking.
 """
@@ -70,24 +72,38 @@ import pandas as pd
 ET = ZoneInfo("America/New_York")
 
 
+# Direction-neutral names, with the original long-only names kept as aliases
+# so existing commands and docs keep working.
+STOP_MODE_ALIASES = {"range_high": "range_edge", "bar_low": "bar_extreme"}
+CONFIRM_ALIASES = {"high": "extreme"}
+
+
 @dataclass
 class Config:
     opening_minutes: int = 30
     vol_lookback: int = 20
     vol_multiple: float = 1.5
     rr_multiple: float = 2.0
-    stop_mode: str = "range_high"  # "range_high" | "bar_low"
+    side: str = "long"  # "long" | "short"
+    stop_mode: str = "range_edge"  # "range_edge" | "bar_extreme"
     buffer_atr_mult: float = 0.10
     min_buffer_pct: float = 0.0005  # 5 bps of price
     atr_length: int = 14
-    confirm_on: str = "close"  # "close" | "high"
+    confirm_on: str = "close"  # "close" | "extreme"
     session_start: time = time(9, 30)
     session_end: time = time(16, 0)
+
+    def __post_init__(self) -> None:
+        self.stop_mode = STOP_MODE_ALIASES.get(self.stop_mode, self.stop_mode)
+        self.confirm_on = CONFIRM_ALIASES.get(self.confirm_on, self.confirm_on)
+        if self.side not in ("long", "short"):
+            raise ValueError(f"side must be 'long' or 'short', got {self.side!r}")
 
 
 @dataclass
 class Signal:
     symbol: str
+    side: str
     session: str
     orh: float
     orl: float
@@ -108,6 +124,7 @@ class Signal:
     is_latest_bar: bool
     last_price: float
     status: str  # "target" | "stopped" | "open" | "no_follow_through"
+    resolved_ambiguously: bool  # resolving bar touched stop AND target
     bars_to_resolution: Optional[int]
     mfe_r: Optional[float]
     mae_r: Optional[float]
@@ -150,25 +167,50 @@ def resample(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
 
 
 def _evaluate_outcome(
-    forward: pd.DataFrame, entry: float, stop: float, target: float, risk: float
-) -> tuple[str, Optional[int], Optional[float], Optional[float]]:
+    forward: pd.DataFrame,
+    entry: float,
+    stop: float,
+    target: float,
+    risk: float,
+    side: str,
+) -> tuple[str, bool, Optional[int], Optional[float], Optional[float]]:
     """Bar-level replay of what happened after entry.
 
     Worst-case convention: a bar touching both levels counts as the stop,
     because bar data cannot say which came first.
+
+    The two sides are spelled out rather than folded into sign arithmetic.
+    A sign error here silently reports losses as wins, which is the worst
+    possible failure mode for this file, so the comparisons stay explicit.
     """
     if forward.empty:
-        return "no_follow_through", None, None, None
+        return "no_follow_through", False, None, None, None
 
-    mfe_r = float(forward["high"].max() - entry) / risk
-    mae_r = float(entry - forward["low"].min()) / risk
+    hi = float(forward["high"].max())
+    lo = float(forward["low"].min())
+
+    if side == "long":
+        mfe_r = (hi - entry) / risk  # favourable = up
+        mae_r = (entry - lo) / risk
+    else:
+        mfe_r = (entry - lo) / risk  # favourable = down
+        mae_r = (hi - entry) / risk
 
     for i, (_, bar) in enumerate(forward.iterrows(), start=1):
-        if bar["low"] <= stop:
-            return "stopped", i, mfe_r, mae_r
-        if bar["high"] >= target:
-            return "target", i, mfe_r, mae_r
-    return "open", None, mfe_r, mae_r
+        if side == "long":
+            hit_stop = bar["low"] <= stop
+            hit_target = bar["high"] >= target
+        else:
+            hit_stop = bar["high"] >= stop
+            hit_target = bar["low"] <= target
+        if hit_stop:
+            # Both touched in one bar: charged as a loss, but flagged so the
+            # cost of that convention stays visible. A stop only pennies from
+            # entry makes this common, which quietly penalises tight stops.
+            return "stopped", bool(hit_target), i, mfe_r, mae_r
+        if hit_target:
+            return "target", False, i, mfe_r, mae_r
+    return "open", False, None, mfe_r, mae_r
 
 
 def _build_signal(
@@ -198,11 +240,23 @@ def _build_signal(
 
     orh = float(opening["high"].max())
     orl = float(opening["low"].min())
+    long_side = cfg.side == "long"
 
-    trigger = after["close"] if cfg.confirm_on == "close" else after["high"]
-    broke = after[trigger > orh]
+    if cfg.confirm_on == "close":
+        trigger = after["close"]
+    else:
+        trigger = after["high"] if long_side else after["low"]
+
+    if long_side:
+        broke = after[trigger > orh]
+        edge, edge_name = orh, "ORH"
+    else:
+        broke = after[trigger < orl]
+        edge, edge_name = orl, "ORL"
+
     if broke.empty:
-        return None, f"no {cfg.confirm_on} above ORH {orh:.2f}"
+        direction = "above" if long_side else "below"
+        return None, f"no {cfg.confirm_on} {direction} {edge_name} {edge:.2f}"
 
     bo_ts = broke.index[0]
     bo = frame.loc[bo_ts]
@@ -227,22 +281,34 @@ def _build_signal(
     atr_val = float(atr_raw) if np.isfinite(atr_raw) else 0.0
 
     entry = float(bo["close"])
-    level = orh if cfg.stop_mode == "range_high" else float(bo["low"])
     buffer = max(cfg.buffer_atr_mult * atr_val, cfg.min_buffer_pct * entry)
-    stop = level - buffer
-    risk = entry - stop
+
+    if cfg.stop_mode == "range_edge":
+        level = edge
+    else:
+        level = float(bo["low"]) if long_side else float(bo["high"])
+
+    if long_side:
+        stop = level - buffer
+        risk = entry - stop
+        target = entry + cfg.rr_multiple * risk
+    else:
+        stop = level + buffer
+        risk = stop - entry
+        target = entry - cfg.rr_multiple * risk
 
     if risk <= 0:
-        return None, f"non-positive risk (entry {entry:.2f} <= stop {stop:.2f})"
+        rel = "<=" if long_side else ">="
+        return None, f"non-positive risk (entry {entry:.2f} {rel} stop {stop:.2f})"
 
-    target = entry + cfg.rr_multiple * risk
-    status, bars_to, mfe_r, mae_r = _evaluate_outcome(
-        today[today.index > bo_ts], entry, stop, target, risk
+    status, ambiguous, bars_to, mfe_r, mae_r = _evaluate_outcome(
+        today[today.index > bo_ts], entry, stop, target, risk, cfg.side
     )
 
     return (
         Signal(
             symbol=symbol,
+            side=cfg.side,
             session=today.index[0].date().isoformat(),
             orh=round(orh, 4),
             orl=round(orl, 4),
@@ -252,7 +318,7 @@ def _build_signal(
             target=round(target, 4),
             risk=round(risk, 4),
             risk_pct=round(risk / entry * 100, 3),
-            reward=round(target - entry, 4),
+            reward=round(abs(target - entry), 4),
             rr=cfg.rr_multiple,
             vol=float(bo["volume"]),
             vol_benchmark=round(benchmark, 1),
@@ -263,6 +329,7 @@ def _build_signal(
             is_latest_bar=bool(bo_ts == today.index[-1]),
             last_price=round(float(today["close"].iloc[-1]), 4),
             status=status,
+            resolved_ambiguously=ambiguous,
             bars_to_resolution=bars_to,
             mfe_r=round(mfe_r, 2) if mfe_r is not None else None,
             mae_r=round(mae_r, 2) if mae_r is not None else None,
@@ -336,7 +403,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--vol-lookback", type=int, default=20)
     p.add_argument("--vol-multiple", type=float, default=1.5)
     p.add_argument("--rr-multiple", type=float, default=2.0)
-    p.add_argument("--stop-mode", choices=("range_high", "bar_low"), default="range_high")
+    p.add_argument("--side", choices=("long", "short", "both"), default="long")
+    p.add_argument(
+        "--stop-mode",
+        choices=("range_edge", "bar_extreme", "range_high", "bar_low"),
+        default="range_edge",
+        help="range_edge = just past the broken level; bar_extreme = just past "
+             "the breakout bar's own extreme (range_high/bar_low are aliases)",
+    )
     p.add_argument("--buffer-atr-mult", type=float, default=0.10)
     p.add_argument("--min-buffer-pct", type=float, default=0.0005)
     p.add_argument("--confirm-on", choices=("close", "high"), default="close")
@@ -344,43 +418,46 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--csv-out", default=None, help="write signals to this path")
     args = p.parse_args(argv)
 
-    cfg = Config(
-        opening_minutes=args.opening_minutes,
-        vol_lookback=args.vol_lookback,
-        vol_multiple=args.vol_multiple,
-        rr_multiple=args.rr_multiple,
-        stop_mode=args.stop_mode,
-        buffer_atr_mult=args.buffer_atr_mult,
-        min_buffer_pct=args.min_buffer_pct,
-        confirm_on=args.confirm_on,
-    )
+    sides = ("long", "short") if args.side == "both" else (args.side,)
 
     frames = load_csv(args.csv, args.input_tz)
     if "" in frames:
         frames = {args.ticker or "SYMBOL": frames.pop("")}
 
+    if args.timeframe:
+        frames = {s: resample(df, args.timeframe) for s, df in frames.items()}
+
     signals: list[Signal] = []
     rejects: list[tuple[str, str]] = []
 
-    for symbol in sorted(frames):
-        df = frames[symbol]
-        if args.timeframe:
-            df = resample(df, args.timeframe)
-        try:
-            sig, reason = screen_symbol(df, symbol, cfg, args.session)
-        except Exception as exc:  # one bad symbol should not kill the scan
-            rejects.append((symbol, f"error: {exc}"))
-            continue
-        if sig is not None:
-            signals.append(sig)
-        else:
-            rejects.append((symbol, reason or "unknown"))
+    for side in sides:
+        cfg = Config(
+            opening_minutes=args.opening_minutes,
+            vol_lookback=args.vol_lookback,
+            vol_multiple=args.vol_multiple,
+            rr_multiple=args.rr_multiple,
+            side=side,
+            stop_mode=args.stop_mode,
+            buffer_atr_mult=args.buffer_atr_mult,
+            min_buffer_pct=args.min_buffer_pct,
+            confirm_on=args.confirm_on,
+        )
+        for symbol in sorted(frames):
+            try:
+                sig, reason = screen_symbol(frames[symbol], symbol, cfg, args.session)
+            except Exception as exc:  # one bad symbol should not kill the scan
+                rejects.append((f"{symbol}/{side}", f"error: {exc}"))
+                continue
+            if sig is not None:
+                signals.append(sig)
+            else:
+                rejects.append((f"{symbol}/{side}", reason or "unknown"))
 
     if signals:
         table = pd.DataFrame([asdict(s) for s in signals])
         cols = [
-            "symbol", "session", "breakout_time", "orh", "entry", "stop",
-            "target", "risk", "risk_pct", "rr", "vol_ratio", "status",
+            "symbol", "side", "session", "breakout_time", "orh", "orl", "entry",
+            "stop", "target", "risk", "risk_pct", "rr", "vol_ratio", "status",
             "mfe_r", "mae_r", "is_latest_bar", "last_price",
         ]
         print(table[cols].to_string(index=False))

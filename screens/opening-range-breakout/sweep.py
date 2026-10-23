@@ -92,6 +92,7 @@ def summarize(signals: list[Signal], cfg: Config) -> dict:
         return {
             "n": 0, "wins": 0, "losses": 0, "unresolved": 0,
             "win_rate": None, "expectancy_r": None, "expectancy_mtm_r": None,
+            "pct_ambig": None,
             "avg_mfe_r": None, "avg_mae_r": None, "median_risk_pct": None,
         }
 
@@ -121,6 +122,10 @@ def summarize(signals: list[Signal], cfg: Config) -> dict:
         "losses": len(losses),
         "unresolved": len(unresolved),
         "win_rate": round(len(wins) / resolved, 3) if resolved else None,
+        "pct_ambig": (
+            round(sum(s.resolved_ambiguously for s in signals) / resolved, 3)
+            if resolved else None
+        ),
         "expectancy_r": round(exp_r, 3) if exp_r is not None else None,
         "expectancy_mtm_r": round(sum(mtm) / len(mtm), 3) if mtm else None,
         "avg_mfe_r": round(sum(mfes) / len(mfes), 2) if mfes else None,
@@ -137,6 +142,7 @@ def sweep(
     rr_multiples: list[float],
     stop_modes: list[str],
     base: Config,
+    sides: tuple[str, ...] = ("long",),
 ) -> tuple[pd.DataFrame, dict[tuple, list[Signal]]]:
     """Grid over the thresholds, plus a volume-filter-off baseline per cell."""
     rows: list[dict] = []
@@ -145,13 +151,18 @@ def sweep(
     # vol_multiple 0 passes every breakout: the no-filter control.
     vol_grid = sorted(set([0.0] + list(vol_multiples)))
 
-    for stop_mode, rr, vm in itertools.product(stop_modes, rr_multiples, vol_grid):
-        cfg = replace(base, stop_mode=stop_mode, rr_multiple=rr, vol_multiple=vm)
+    for side, stop_mode, rr, vm in itertools.product(
+        sides, stop_modes, rr_multiples, vol_grid
+    ):
+        cfg = replace(
+            base, side=side, stop_mode=stop_mode, rr_multiple=rr, vol_multiple=vm
+        )
         signals = collect_signals(frames, cfg)
-        collected[(stop_mode, rr, vm)] = signals
+        collected[(side, stop_mode, rr, vm)] = signals
         rows.append(
             {
-                "stop_mode": stop_mode,
+                "side": side,
+                "stop_mode": cfg.stop_mode,
                 "rr": rr,
                 "vol_mult": "BASELINE" if vm == 0.0 else f"{vm:g}",
                 **summarize(signals, cfg),
@@ -173,7 +184,11 @@ def baseline_comparison(
     cells meeting `min_n` are eligible to win.
     """
     out: list[dict] = []
-    for (stop_mode, rr), grp in table.groupby(["stop_mode", "rr"], sort=False):
+    keys = [c for c in ("side", "stop_mode", "rr") if c in table.columns]
+    for key, grp in table.groupby(keys, sort=False):
+        label = dict(zip(keys, key if isinstance(key, tuple) else (key,)))
+        side = label.get("side", "long")
+        stop_mode, rr = label["stop_mode"], label["rr"]
         base_rows = grp[grp["vol_mult"] == "BASELINE"]
         filt = grp[(grp["vol_mult"] != "BASELINE") & (grp["n"] >= min_n)]
         if base_rows.empty or base_rows.iloc[0][sort_col] is None:
@@ -186,18 +201,20 @@ def baseline_comparison(
         eligible = filt.dropna(subset=[sort_col])
         if eligible.empty:
             out.append({
-                "stop_mode": stop_mode, "rr": rr, "baseline": base_val,
-                "baseline_n": base_n, "best_filtered": None, "vol_mult": None,
-                "n": None, "delta": None, "verdict": f"no filter cell reached n>={min_n}",
+                "side": side, "stop_mode": stop_mode, "rr": rr,
+                "baseline": base_val, "baseline_n": base_n,
+                "best_filtered": None, "vol_mult": None, "n": None,
+                "delta": None, "verdict": f"no filter cell reached n>={min_n}",
             })
             continue
 
         best = eligible.loc[eligible[sort_col].idxmax()]
         delta = best[sort_col] - base_val
         out.append({
-            "stop_mode": stop_mode, "rr": rr, "baseline": base_val,
-            "baseline_n": base_n, "best_filtered": best[sort_col],
-            "vol_mult": best["vol_mult"], "n": int(best["n"]), "delta": delta,
+            "side": side, "stop_mode": stop_mode, "rr": rr,
+            "baseline": base_val, "baseline_n": base_n,
+            "best_filtered": best[sort_col], "vol_mult": best["vol_mult"],
+            "n": int(best["n"]), "delta": delta,
             "verdict": "filter helps" if delta > 0 else "filter does not help",
         })
     return out
@@ -215,7 +232,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--input-tz", default="America/New_York")
     p.add_argument("--vol-multiples", default="1.25,1.5,2.0,2.5")
     p.add_argument("--rr-multiples", default="1.5,2.0,3.0")
-    p.add_argument("--stop-modes", default="range_high,bar_low")
+    p.add_argument("--sides", default="long", help="long, short, or long,short")
+    p.add_argument("--stop-modes", default="range_edge,bar_extreme")
     p.add_argument("--opening-minutes", type=int, default=30)
     p.add_argument("--vol-lookback", type=int, default=20)
     p.add_argument("--confirm-on", choices=("close", "high"), default="close")
@@ -253,6 +271,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         _floats(args.rr_multiples),
         args.stop_modes.split(","),
         base,
+        tuple(x.strip() for x in args.sides.split(",") if x.strip()),
     )
 
     # Only adequately-powered cells are eligible to be ranked. A cell with
@@ -283,12 +302,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         helped = 0
         for c in comparisons:
             if c["delta"] is None:
-                print(f"  {c['stop_mode']:<10} rr={c['rr']:<4} "
+                print(f"  {c['side']:<5} {c['stop_mode']:<12} rr={c['rr']:<4} "
                       f"baseline {c['baseline']:+.3f}R (n={c['baseline_n']}) "
                       f"— {c['verdict']}")
                 continue
             helped += c["delta"] > 0
-            print(f"  {c['stop_mode']:<10} rr={c['rr']:<4} "
+            print(f"  {c['side']:<5} {c['stop_mode']:<12} rr={c['rr']:<4} "
                   f"baseline {c['baseline']:+.3f}R (n={c['baseline_n']})  "
                   f"best filter {c['vol_mult']}x {c['best_filtered']:+.3f}R "
                   f"(n={c['n']})  {c['delta']:+.3f}R — {c['verdict']}")
@@ -301,6 +320,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.signals_out and not ranked.empty:
         top = ranked.iloc[0]
         key = (
+            top["side"],
             top["stop_mode"],
             float(top["rr"]),
             0.0 if top["vol_mult"] == "BASELINE" else float(top["vol_mult"]),

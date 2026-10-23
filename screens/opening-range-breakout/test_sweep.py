@@ -24,13 +24,14 @@ def sig(status: str, entry: float = 100.0, risk: float = 1.0,
         last: float = 100.0, mfe: float = 0.0, mae: float = 0.0) -> Signal:
     """Minimal Signal carrying only the fields summarize() reads."""
     return Signal(
-        symbol="T", session="2026-10-22", orh=100.0, orl=99.0,
+        symbol="T", side="long", session="2026-10-22", orh=100.0, orl=99.0,
         breakout_time="2026-10-22 10:00 EDT", entry=entry,
         stop=entry - risk, target=entry + 2 * risk, risk=risk,
         risk_pct=risk / entry * 100, reward=2 * risk, rr=2.0,
         vol=0.0, vol_benchmark=1.0, vol_ratio=2.0, vol_window_bars=20,
         vol_window_crossed_session=False, atr=1.0, is_latest_bar=False,
-        last_price=last, status=status, bars_to_resolution=1,
+        last_price=last, status=status, resolved_ambiguously=False,
+        bars_to_resolution=1,
         mfe_r=mfe, mae_r=mae,
     )
 
