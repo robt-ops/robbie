@@ -1,5 +1,11 @@
 # ETF BBMR — Backtest Review (2026-11-02)
 
+> **Superseded in part.** `etf_bbmr.py` was added to this folder on 2026-11-06.
+> Reading it shows the three runs below came from an **8-symbol** version of the
+> script, while the committed file carries a **23-symbol** `UNIVERSE`. The numbers
+> in this section are still what those runs printed, but the current file will not
+> reproduce them. See [Source review](#source-review-2026-11-06).
+
 Review of the first three `etf_bbmr.py` backtest runs plus one live scan, from the
 session of 2026-11-02. **The script itself is not yet in this repo** — see
 [Getting the source in here](#getting-the-source-in-here).
@@ -110,15 +116,16 @@ The 15m and 5m runs cover the same stated period but report SPY buy & hold as
 Small, but it means the benchmark is computed from the sample rather than from a
 fixed date range.
 
-## Open questions — need the source
+## Open questions — answered 2026-11-06
 
-1. **Are commissions and slippage modelled?** Decisive for 5m, where the average
-   win is +0.20%. A cent or two per side plausibly erases it. Unanswerable from
-   the output alone.
-2. **Does `backtest` accept `--equity`?** See finding 1.
-3. **What does `--apply` do?** Writes an order file, or hits a broker API? It was
-   run live once with `--apply` and placed nothing, so the behaviour is still
-   unobserved.
+All three are closed by the source; see [Source review](#source-review-2026-11-06).
+
+1. **Commissions and slippage:** not modelled at all. Entries and exits book raw
+   OHLC prices. This kills 5m.
+2. **`backtest` and `--equity`:** `backtest` takes `--cash` (default `100_000`);
+   only `scan` takes `--equity`. The $100k inference was exactly right.
+3. **`--apply`:** writes a local JSON state file and places no orders. The live
+   order path is the separate, undocumented `--webhook URL`.
 
 ## Recommendations
 
@@ -156,3 +163,111 @@ python etf_bbmr.py backtest --tf 1h
 The warning spam in the original session is yfinance 1.7.0 calling `inplace=` on
 pandas 3.1.0, which deprecated it (PDEP-8). Cosmetic, and fixed upstream in
 yfinance eventually; `PYTHONWARNINGS=ignore` is the cheap workaround.
+
+
+---
+
+## Source review (2026-11-06)
+
+`etf_bbmr.py` as committed here. Line references are to that file.
+
+### The three open questions, closed
+
+**Costs are not modelled anywhere.** No commission, slippage, spread or fee term
+exists in the file — entries book `bars[s]["Close"]` raw, TP exits book
+`b["Close"]`, SL exits book `min(b["Open"], stop)`. So every return above is
+gross. Combined with the cost table in this review, **5m is dead**: its +0.01%
+average trade is one basis point, and it goes negative at any real cost. 15m was
+already negative. 1h's +0.15% (15 bp) survives the 1–3 bp round trip these ETFs
+actually cost.
+
+**`backtest` never accepted `--equity`.** The subparsers differ:
+`backtest` takes `--cash` (default `100_000`), `scan` takes `--equity`
+(required). `--cash` was never passed, so all three runs used the $100k default.
+The implied-equity arithmetic in this review recovered that correctly. Passing
+`backtest --equity 250000` would have been an argparse error, not a silent
+default — so the two subcommands disagreeing is a naming problem, not a data
+problem.
+
+**`--apply` places no orders.** It writes `bbmr_state_{tf}.json` locally,
+recording signalled fills at the signal bar's close. The live order path is
+`--webhook URL`, which POSTs each action as JSON. The 2026-11-02 run used
+`--apply` without `--webhook`, so nothing reached a broker.
+
+### Universe mismatch — the committed file does not reproduce these runs
+
+The docstring says `Universe : SPY QQQ IWM DIA XLK XLF XLV SCHD`. The code says:
+
+```python
+UNIVERSE = ["SPY","QQQ","IWM","DIA","XLK","XLF","XLV","SCHD",   # the 8 that traded
+            "XLE","XLI","XLY","XLP","XLU","XLC","XLB","XLRE",   # never appear
+            "RSP","SMH","EFA","EEM","GLD","TLT","HYG"]          # in any output
+```
+
+23 symbols. The three runs traded **exactly the first 8**, which are exactly the
+docstring's list. Across 716 trades and ~1063 days, with GLD, TLT, HYG, SMH and
+EEM in the list, 15 symbols never once producing the deepest band break is not
+credible. The list was extended after those runs, and the docstring was not
+updated to match.
+
+So the reviewed numbers describe an 8-symbol strategy, and the file now describes
+a 23-symbol one. **Re-run all three timeframes before drawing any further
+conclusion from them.** The concentration finding below is about the 8-symbol
+run and should be re-derived after that.
+
+### Bugs found
+
+**1. TP triggers on the high but fills at the close — and this *understates*
+returns.**
+
+```python
+elif b["High"] >= b["basis"]:
+    px, why = b["Close"], "TP"
+```
+
+The exit fires when the bar touches the 20-SMA basis intrabar, then books the
+bar's **close**, which can be far below the basis and below the entry. That is
+the real mechanism behind the losing "TP" exits this review inferred from the
+exit counts (37% of TP exits on 15m, 35% on 5m) — not band drift, as this review
+originally guessed.
+
+The direction matters: a resting limit sell at the basis would have filled *at
+the basis*. Booking the close instead is pessimistic, so **1h's +5.27% is a
+floor, not a ceiling**, for a limit-order implementation. `scan` has the same
+behaviour (`price=round(b.Close, 2)` on a `b.High >= b.basis` trigger), so this
+is a strategy design choice leaving money on the table, not a backtest-vs-live
+mismatch. Fixing it to `px = max(b["basis"], b["Open"])` is the single cheapest
+candidate improvement in the file.
+
+**2. The SPY buy & hold benchmark starts 20 bars late.**
+
+```python
+spy.iloc[-1] / spy.iloc[BB_LEN] - 1
+```
+
+`iloc[BB_LEN]` is bar 20, not bar 0 — presumably to skip the Bollinger warm-up,
+but the benchmark should still span the whole window. Because bar 20 is a
+different calendar moment per timeframe (5 hours in on 15m, 100 minutes in on
+5m), this fully explains the −1.12% vs −1.48% discrepancy this review flagged
+over the same stated period. Use `spy.iloc[0]`.
+
+**3. A webhook failure loses the state write, risking duplicate orders.**
+
+The `if webhook:` loop runs *before* `if apply:`, and `urllib.request.urlopen`
+is unguarded. Any exception — timeout, 500, DNS — propagates and kills the
+process before `state_f.write_text(...)`. Orders have then been sent but no fill
+is recorded, so the next scan re-signals the same buy. Write state first, or wrap
+each POST and persist regardless.
+
+**4. `fetch_bars` calls `sys.exit` if any one symbol returns no data.** With 23
+symbols, one Yahoo hiccup aborts the whole run. Skip the symbol and log it.
+
+### Recommended order of work
+
+1. Decide the universe — 8 or 23 — fix the docstring to match, and re-run 1h.
+2. Fix the TP fill (bug 1). Re-run 1h and compare; this is the one change that
+   could move the result materially.
+3. Fix the benchmark (bug 2) and the webhook ordering (bug 3).
+4. Rename `--cash` to `--equity` on `backtest`, or accept both, so the two
+   subcommands stop describing different account sizes.
+5. Then, and only then, the split-sample concentration test on 1h.
