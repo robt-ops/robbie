@@ -1,10 +1,10 @@
 # ETF BBMR — Backtest Review (2026-11-02)
 
-> **Superseded in part.** `etf_bbmr.py` was added to this folder on 2026-11-06.
-> Reading it shows the three runs below came from an **8-symbol** version of the
-> script, while the committed file carries a **23-symbol** `UNIVERSE`. The numbers
-> in this section are still what those runs printed, but the current file will not
-> reproduce them. See [Source review](#source-review-2026-11-06).
+> **Superseded.** `etf_bbmr.py` was committed on 2026-11-06, and the strategy was
+> then re-run on real broker data. The numbers in this first section are what the
+> original Yahoo-fed runs printed; they are kept for the record only. The universe
+> mismatch is now **confirmed**, the TP-fill recommendation is **withdrawn**, and
+> the live conclusions are in [Connector-fed re-run](#connector-fed-re-run-2026-11-06).
 
 Review of the first three `etf_bbmr.py` backtest runs plus one live scan, from the
 session of 2026-11-02. **The script itself is not yet in this repo** — see
@@ -271,3 +271,105 @@ symbols, one Yahoo hiccup aborts the whole run. Skip the symbol and log it.
 4. Rename `--cash` to `--equity` on `backtest`, or accept both, so the two
    subcommands stop describing different account sizes.
 5. Then, and only then, the split-sample concentration test on 1h.
+
+
+---
+
+## Connector-fed re-run (2026-11-06)
+
+Re-run with `bbmr_connector.py`, a faithful port of `etf_bbmr.py` fed by Robinhood
+connector bars instead of `yf.download`. Same feed the GC15 system trades on, so
+signals and execution finally share a data source. No Yahoo involved.
+
+### Data note: Robinhood pads missing history with fake bars
+
+Asking for 1h bars from 2023-12-05 returned 4,386 bars, of which **3,063 (69.8%)
+carried `interpolated: true`** — synthesised flat gap-fill at a constant `683.11`,
+a 2025 price stamped on 2023 timestamps. Real hourly history begins **2025-12-22**.
+
+Left in, those bars would have produced a run reporting `Period 2023-12-05 ->
+2026-11-06` with two of its three years a zero-volatility straight line, plus a
+poisoned σ/SMA warm-up at the seam. `bbmr_connector.py` drops every interpolated
+bar. **Any future connector pull must do the same.**
+
+Usable sample: 1,323 real hourly bars per symbol, 2025-12-22 → 2026-11-06
+(~189 trading days, ~10.5 months), risk-on 73.5%, SPY buy & hold +7.57%.
+This is a **different and shorter window** than the original 1h run claimed, so
+none of these figures are comparable to the +5.27% above.
+
+### Results
+
+| | 8 symbols | 23 symbols |
+|---|---|---|
+| Total return | **+1.33%** | +0.99% |
+| SPY B&H (same window) | +7.57% | +7.57% |
+| Max drawdown | **−0.54%** | −1.43% |
+| Profit factor | **1.33** | 1.11 |
+| Trades | 158 | 296 |
+| Win rate | 63.3% | 62.5% |
+| Avg trade | **+0.18%** | +0.07% |
+| Avg win / avg loss | +1.10% / −1.40% | +1.09% / −1.62% |
+| Avg exposure | 5.5% | 10.5% |
+| Bars at 4 open | 8.5% | 26.9% |
+| Symbols that traded | 8 of 8 | **23 of 23** |
+
+### 1. Universe mismatch: confirmed
+
+With all 23 symbols live, **every one of them trades** — including GLD, TLT, HYG,
+SMH, EEM and EFA. The original per-symbol tables listed only 8. So those runs
+cannot have come from the 23-symbol file, exactly as inferred. The circumstantial
+case is now a measured one.
+
+### 2. The extended universe is worse, not just different
+
+Adding the 15 extra symbols **doubles exposure, triples saturation at the
+4-position cap, nearly triples drawdown — and earns less money**. Profit factor
+falls 1.33 → 1.11 and average trade falls 60%, from +0.18% to +0.07%.
+
+Per-symbol, the 15 additions are where the damage is: XLK −$721, EEM −$710,
+SMH −$345, EFA −$279 (3 trades, −1.84% average), TLT −$112, XLE −$148. XLB
+(+$658), XLI (+$436) and GLD (+$410) are the only strong additions, and they do
+not cover the rest.
+
+**Recommendation: revert `UNIVERSE` to the 8 symbols in the docstring.** The
+docstring was right and the code drifted away from it.
+
+### 3. The TP-fill fix is withdrawn — the original is better
+
+This review previously argued that triggering on `High >= basis` but filling at
+`Close` was pessimistic, and that `max(basis, Open)` was "the single cheapest
+candidate improvement in the file". **That was wrong.** Measured:
+
+| TP fill | 8 symbols | 23 symbols | Win rate (8) | Losing TP exits (8) |
+|---|---|---|---|---|
+| `Close` (original) | **+1.33%** | **+0.99%** | 63.3% | 13 of 113 (11.5%) |
+| `max(basis, Open)` | +1.19% | +0.89% | 65.8% | 9 of 113 (8.0%) |
+
+Capping the fill at the basis does clean up the exit mix — win rate rises and
+losing TP exits fall from 11.5% to 8.0% — but it **loses money overall**, because
+it also surrenders every bar that closes *above* the basis. The original
+reasoning only considered the downside case. Holding to the close is a mix of
+giving up some gains and capturing others, and the captures win.
+
+The labelling observation stands: ~11.5% of `TP` exits are losses, and reporting
+them as `TP` still hides that. Split the label for readability — but do not
+change the fill.
+
+### 4. Still the same shape of problem
+
++1.33% against SPY's +7.57% over the same window, at 5.5% average exposure. The
+edge per trade is real (+0.18%, PF 1.33, and it survives the 1–3 bp round trip
+these ETFs cost) but the strategy is idle ~94% of the time. Raising participation
+remains the open question — not widening the universe, which has now been tested
+and found harmful.
+
+### Revised order of work
+
+1. ~~Decide the universe~~ — **done: use the 8.**
+2. ~~Fix the TP fill~~ — **done: leave it alone.**
+3. Fix the benchmark (`spy.iloc[0]`, not `spy.iloc[BB_LEN]`) and the webhook
+   ordering — both still open, both still worth doing.
+4. Split the `TP` label into target-hit vs below-entry for readability.
+5. Deeper history for a walk-forward test. Robinhood gives ~10.5 real months at
+   1h and IBKR caps at 1000 bars with no backward paging, so a longer sample
+   needs a different data source.
