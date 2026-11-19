@@ -2,10 +2,19 @@
   "mcpServers": {
     "agent-browser": {
       "command": "node",
-      "args": ["/opt/oxylabs-ab-mcp/dist/cli.js"],
+      "args": [
+        "/opt/oxylabs-ab-mcp/dist/cli.js"
+      ],
       "env": {
         "OXY_AB_USERNAME": "${OXY_AB_USERNAME}",
         "OXY_AB_PASSWORD": "${OXY_AB_PASSWORD}"
+      }
+    },
+    "oxylabs-web-api": {
+      "type": "http",
+      "url": "https://mcp.oxylabs.io/web-api-mcp",
+      "headers": {
+        "Authorization": "Bearer ${OXYLABS_WEB_API_KEY}"
       }
     }
   }
