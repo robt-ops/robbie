@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "agent-browser": {
+      "command": "node",
+      "args": ["/opt/oxylabs-ab-mcp/dist/cli.js"],
+      "env": {
+        "OXY_AB_USERNAME": "${OXY_AB_USERNAME}",
+        "OXY_AB_PASSWORD": "${OXY_AB_PASSWORD}"
+      }
+    }
+  }
+}
