@@ -1,0 +1,159 @@
+{
+ "artifact": "thor-crosssource-integrity-2026-11-27",
+ "generated_at": "2026-11-27T03:30:00Z",
+ "generated_by": "cloud session (Claude Code) - no access to the local Codex workspace; built from live broker feeds only",
+ "research_only": true,
+ "trades_placed": "none - no live or paper orders were placed or staged",
+ "promotion_status": "DISABLED - unchanged",
+
+ "scope_limitation": {
+  "note": "The local workspace /Users/thor/Documents/Codex/2026-08-04/referenced-chatgpt-conversation-this-is-an was NOT reachable from this cloud session. Remote Control lists both machines' folders as not offered to cloud sessions. None of the 97 analysis .mjs files, the tuned 3-Bar parameter set, or the prior candidate JSONs could be read.",
+  "consequence": "The tuned 3-Bar short-only configuration could not be reproduced. The forward short-event counter was NOT recomputed and remains 8/20 as previously recorded.",
+  "what_was_possible": "Direct Webull and Robinhood 5m bar pulls via MCP connectors, cross-source integrity audit, and a faithful-but-BASELINE v1 short-only scan."
+ },
+
+ "data_refresh": {
+  "window": "2026-11-10 .. 2026-11-25",
+  "timeframe": "5m",
+  "symbols": ["AMD", "MU"],
+  "sessions_per_source": 12,
+  "bars_per_session": 78,
+  "grid": "14:30Z .. 20:55Z inclusive, both sources, perfectly aligned",
+  "webull": {
+   "session_filter": "RTH",
+   "bars": 936,
+   "zero_volume": 0,
+   "interpolated": 0,
+   "extends_prior_boundary_from": "2026-11-24T16:45:00Z",
+   "extends_prior_boundary_to": "2026-11-25T20:55:00Z"
+  },
+  "robinhood": {
+   "session_filter": "regular",
+   "bars": 936,
+   "zero_volume": 0,
+   "interpolated": 0,
+   "status_change": "RESOLVED - Robinhood now returns real traded bars for 2026-11-24 and 2026-11-25. The prior blocker (Nov 24 was interpolated zero-volume placeholders only) no longer applies."
+  },
+  "calendar": {
+   "2026-11-26": "Thanksgiving - US equity markets closed, no bars expected",
+   "2026-11-27": "half session (opens 14:30Z, closes 18:00Z). At pull time (~03:13Z) the session had not opened; no bars available yet."
+  }
+ },
+
+ "finding_1_robinhood_unblocked": {
+  "severity": "unblocks-next-action",
+  "claim": "Robinhood traded bars for Nov 24 and Nov 25 are now valid: 78 bars/day/symbol, zero zero-volume, zero interpolated.",
+  "implication": "Next action 4 (build a synchronized four-source extension and rerun the lead stability audit) is no longer blocked on Robinhood data availability.",
+  "caveat": "See finding_2 - validity at the day level does NOT imply validity at the bar level."
+ },
+
+ "finding_2_underfilled_bars": {
+  "severity": "HIGH - data integrity bug affecting the cross-source baseline",
+  "claim": "Robinhood 5m bars include bars that are non-zero-volume and NOT flagged interpolated, but are severely under-filled: volume 5x to 26,302x below Webull for the same minute, with price range collapsed to 2-49% of Webull's.",
+  "counts_range_aware_gate": { "AMD": 11, "MU": 13, "total": 24, "of_bars": 1872 },
+  "counts_volume_only_gate": { "AMD": 15, "MU": 18, "note": "volume-only test false-positives on the legitimate 20:55 auction bar, where Robinhood reports less auction volume but the IDENTICAL high/low. The gate therefore requires a range collapse as well." },
+  "worst_cases": [
+   { "symbol": "MU",  "t": "2026-11-20T20:55:00Z", "robinhood_volume": 286, "webull_volume": 7522325, "ratio": "26302x", "range_fraction": 0.02 },
+   { "symbol": "AMD", "t": "2026-11-12T18:05:00Z", "robinhood_volume": 87,  "webull_volume": 271374,  "ratio": "3119x",  "range_fraction": 0.00 },
+   { "symbol": "MU",  "t": "2026-11-12T18:05:00Z", "robinhood_volume": 546, "webull_volume": 141874,  "ratio": "260x",   "range_fraction": 0.03 },
+   { "symbol": "AMD", "t": "2026-11-12T16:00:00Z", "robinhood_volume": 76058, "webull_volume": 1321628, "ratio": "17.4x", "range_fraction": 0.17, "close_divergence_bp": 106 }
+  ],
+  "why_existing_guard_misses_them": "The pipeline rejects zero-volume and interpolated==true bars. These bars satisfy both checks and pass straight into traded-bar backtests.",
+  "remedy_shipped": "analysis/qa/flag-underfilled-bars.mjs - range-aware cross-source gate, importable (flagUnderfilled, underfilledTimestamps) or runnable as a CLI. Default thresholds: volume ratio > 5x AND candidate range < 50% of reference range.",
+  "recommended_action": "Run this gate on every Robinhood extension before any synchronized four-source audit, and exclude flagged timestamps from traded-bar backtests on BOTH sides of the comparison so the bar grids stay symmetric."
+ },
+
+ "finding_3_overall_divergence": {
+  "severity": "informational",
+  "amd": { "matched_bars": 936, "mean_abs_close_divergence_bp": 0.35, "max_abs_close_divergence_usd": 6.1428, "max_at": "2026-11-12T16:00:00Z", "bars_over_50bp": 1 },
+  "mu":  { "matched_bars": 936, "mean_abs_close_divergence_bp": 0.28, "max_abs_close_divergence_usd": 2.7400, "max_at": "2026-11-12T16:00:00Z", "bars_over_50bp": 0 },
+  "note": "Mean divergence is negligible. Every material outlier coincides with an under-filled Robinhood bar from finding_2, so price divergence is a symptom of the fill problem rather than an independent issue."
+ },
+
+ "finding_4_volume_gate_is_the_binding_constraint": {
+  "severity": "HIGH - methodology",
+  "filter_attrition_v1_short_only": {
+   "note": "cumulative survivors through the v1 short-only filter chain, Nov 10-25, per source/symbol",
+   "stages": [
+    { "stage": "eligible bars",             "WEBULL_AMD": 886, "WEBULL_MU": 886, "ROBINHOOD_AMD": 886, "ROBINHOOD_MU": 886 },
+    { "stage": "bar1 bull",                 "WEBULL_AMD": 433, "WEBULL_MU": 427, "ROBINHOOD_AMD": 435, "ROBINHOOD_MU": 423 },
+    { "stage": "bar2 higher high",          "WEBULL_AMD": 293, "WEBULL_MU": 280, "ROBINHOOD_AMD": 292, "ROBINHOOD_MU": 277 },
+    { "stage": "bar3 bear",                 "WEBULL_AMD": 155, "WEBULL_MU": 155, "ROBINHOOD_AMD": 154, "ROBINHOOD_MU": 154 },
+    { "stage": "bar3 strict (c < low[1])",  "WEBULL_AMD":  61, "WEBULL_MU":  62, "ROBINHOOD_AMD":  59, "ROBINHOOD_MU":  61 },
+    { "stage": "body >= 50%",               "WEBULL_AMD":  45, "WEBULL_MU":  39, "ROBINHOOD_AMD":  43, "ROBINHOOD_MU":  38 },
+    { "stage": "close < EMA50",             "WEBULL_AMD":  27, "WEBULL_MU":  23, "ROBINHOOD_AMD":  27, "ROBINHOOD_MU":  23 },
+    { "stage": "volume > 1.25x SMA20",      "WEBULL_AMD":   3, "WEBULL_MU":   2, "ROBINHOOD_AMD":   4, "ROBINHOOD_MU":   3 },
+    { "stage": "in session",                "WEBULL_AMD":   2, "WEBULL_MU":   2, "ROBINHOOD_AMD":   3, "ROBINHOOD_MU":   3 },
+    { "stage": "HTF 15m bearish",           "WEBULL_AMD":   2, "WEBULL_MU":   2, "ROBINHOOD_AMD":   3, "ROBINHOOD_MU":   3 },
+    { "stage": "close < VWAP",              "WEBULL_AMD":   1, "WEBULL_MU":   2, "ROBINHOOD_AMD":   2, "ROBINHOOD_MU":   3 }
+   ]
+  },
+  "claim": "The volume gate alone removes 85-91% of surviving candidates (27 -> 3). Every other filter downstream of it removes almost nothing. Short-event frequency is therefore almost entirely a function of volMult, not of the pattern or the trend filters.",
+  "event_rate_sensitivity": {
+   "note": "AMD+MU combined signal counts over 12 sessions; events/session averaged across the two sources; 'sessions_for_plus_12' = trading sessions needed to add the 12 events still required to reach the 20-event gate",
+   "rows": [
+    { "baseline": "SMA20 raw",    "volMult": 1.25, "webull": 3,  "robinhood": 5,  "events_per_session": 0.33, "sessions_for_plus_12": 36 },
+    { "baseline": "SMA20 raw",    "volMult": 1.00, "webull": 9,  "robinhood": 15, "events_per_session": 1.00, "sessions_for_plus_12": 12 },
+    { "baseline": "SMA20 raw",    "volMult": 0.75, "webull": 24, "robinhood": 28, "events_per_session": 2.17, "sessions_for_plus_12": 6 },
+    { "baseline": "SMA20 no-auc", "volMult": 1.25, "webull": 4,  "robinhood": 5,  "events_per_session": 0.38, "sessions_for_plus_12": 32 },
+    { "baseline": "SMA20 no-auc", "volMult": 1.00, "webull": 12, "robinhood": 16, "events_per_session": 1.17, "sessions_for_plus_12": 11 },
+    { "baseline": "MED20 no-auc", "volMult": 1.25, "webull": 6,  "robinhood": 7,  "events_per_session": 0.54, "sessions_for_plus_12": 23 },
+    { "baseline": "MED20 no-auc", "volMult": 1.00, "webull": 15, "robinhood": 14, "events_per_session": 1.21, "sessions_for_plus_12": 10 }
+   ]
+  },
+  "curve_fitting_warning": "volMult is the one knob that controls how fast the 8/20 forward-evidence counter fills. Lowering it to make forward evidence arrive sooner would convert the forward-evidence gate from an out-of-sample test into an in-sample selection, which is precisely the failure the gate exists to prevent. volMult should be frozen at whatever the tuned configuration already specifies, and the calendar cost of the 20-event requirement accepted as-is."
+ },
+
+ "finding_5_auction_bar_contaminates_volume_baseline": {
+  "severity": "MEDIUM - bug, and a cross-source comparability defect",
+  "claim": "The 20:55Z closing-auction bar is an order of magnitude larger than a typical bar and sits inside the 20-bar volume window for the first 20 bars (100 minutes) of the FOLLOWING session, inflating the volume baseline and suppressing morning signals.",
+  "auction_bar_vs_median_bar": {
+   "WEBULL_AMD": { "median_auction": 4191690, "median_other": 409271, "ratio": 10.2 },
+   "WEBULL_MU":  { "median_auction": 3080864, "median_other": 305559, "ratio": 10.1 },
+   "ROBINHOOD_AMD": { "median_auction": 1090404, "median_other": 243656, "ratio": 4.5 },
+   "ROBINHOOD_MU":  { "median_auction": 768099,  "median_other": 205921, "ratio": 3.7 }
+  },
+  "cross_source_defect": "The auction bar is 10.2x the median bar on Webull but only 4.5x on Robinhood, and Robinhood reports roughly 60-70% of Webull's volume overall (median WB/RH ratio 1.63 AMD, 1.43 MU). The volume gate is therefore materially STRICTER on Webull than on Robinhood for the same nominal volMult. Any Webull-vs-Robinhood signal agreement test is biased by this, and it explains the asymmetric signal counts (Webull 3 vs Robinhood 5 at volMult 1.25).",
+  "recommended_action": "Exclude the closing-auction bar from the volume baseline, or use a 20-bar MEDIAN instead of an SMA, and re-derive volMult per source so the gate admits a comparable fraction of bars on each feed before claiming cross-source confirmation. Treat this as a bug fix, then re-run the four-source audit - do NOT treat the resulting change in event counts as evidence for or against the strategy."
+ },
+
+ "baseline_v1_short_only_scan": {
+  "disclaimer": "This is the v1.pine BASELINE parameter set (volMult 1.25, body 50%, strict bar 3, 1.25 ATR stop, 2.00 ATR target, BE at 1.00 ATR, 12-bar time stop, session 0835-1455 America/Chicago), short-only. It is NOT the tuned configuration and is NOT a verdict on the lead candidate.",
+  "friction": "0.01% commission per side plus 2 ticks slippage per side, adverse on both legs; stop checked before target when a bar touches both",
+  "indicator_state": "computed over full available history, trades partitioned afterwards (per the Semis-Momentum bugfix rule)",
+  "results": [
+   { "source": "webull",    "symbol": "AMD", "trades": 1, "profit_factor": 0.000, "net": -3.77, "win_rate": 0.00 },
+   { "source": "webull",    "symbol": "MU",  "trades": 2, "profit_factor": 0.000, "net": -9.61, "win_rate": 0.00 },
+   { "source": "robinhood", "symbol": "AMD", "trades": 2, "profit_factor": 0.000, "net": -3.91, "win_rate": 0.00 },
+   { "source": "robinhood", "symbol": "MU",  "trades": 3, "profit_factor": 2.870, "net":  8.01, "win_rate": 0.33 }
+  ],
+  "forward_window_after_2026-11-24T16:45:00Z": {
+   "webull_AMD": 0, "webull_MU": 0, "robinhood_AMD": 0, "robinhood_MU": 0,
+   "cross_source_confirmed_new_short_events": 0
+  },
+  "interpretation": "Too few trades for any statistical claim; reported only to document that the baseline parameterisation is far too sparse to generate forward evidence, and that the sparsity traces to the volume gate (finding_4)."
+ },
+
+ "forward_evidence_counter": {
+  "unique_short_forward_events": "8 / 20 - UNCHANGED",
+  "reason_unchanged": "The tuned configuration was not reachable from this session, so no new events could be attributed to it. The baseline parameterisation produced 0 cross-source confirmed events in the new window, which is not a substitute.",
+  "promotion": "remains DISABLED"
+ },
+
+ "artifacts_written": [
+  "data/extended-2026-11-27/AMD-m5-webull-extended-2026-11-27.json",
+  "data/extended-2026-11-27/AMD-m5-robinhood-extended-2026-11-27.json",
+  "data/extended-2026-11-27/MU-m5-webull-extended-2026-11-27.json",
+  "data/extended-2026-11-27/MU-m5-robinhood-extended-2026-11-27.json",
+  "analysis/qa/flag-underfilled-bars.mjs"
+ ],
+
+ "next_actions": [
+  "Pull the 2026-11-27 half session (14:30Z-18:00Z) after the close and append it; Nov 26 was a market holiday so no bars exist for it.",
+  "Run analysis/qa/flag-underfilled-bars.mjs over every Robinhood extension and exclude the 24 flagged timestamps from both sides before any synchronized four-source audit.",
+  "Fix the auction-bar contamination of the volume baseline (exclude the 20:55Z bar, or switch to a 20-bar median), then re-derive volMult per source for comparability. Treat as a bug fix, not a tuning result.",
+  "Re-run the four-source lead stability audit on the cleaned synchronized window using the TUNED configuration from the local workspace, which this session could not read.",
+  "Keep volMult frozen at the tuned value; do not lower it to accelerate the 8/20 counter.",
+  "Keep promotion disabled until 20 deduplicated short forward events exist and the cross-source holdout, severe-friction, rolling and breadth gates all pass."
+ ]
+}
